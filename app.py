@@ -2514,7 +2514,7 @@ def build_ui():
                                 info="This option can increase the synthesis speed by up to 2.3x. Only available on Nvidia GPUs.",
                             )
                             gr.Markdown(
-                                "- First synthesis after enabling can take several minutes while kernels compile.\n"
+                                "- First synthesis after enabling can take **up to 5 minutes** while kernels compile.\n"
                                 "- Later syntheses with similar chunk/reference shapes are usually much faster.\n"
                                 "- Changing or unloading LoRA adapters can force another slow reload/compile pass.\n"
                                 "- Some chunks can still pause if their shape is new; this is compilation, not a crash.\n"

@@ -244,7 +244,7 @@ If generation loops, try lowering the repeat count. If speech becomes too clippe
 
 Torch compile is optional and can increase the synthesis speed by up to 2.3x (Nvidia GPU only)
 
-- First generation can be slower (take several minutes) because kernels need warmup.
+- First generation can be slower (take up to 5 minutes) because kernels need warmup.
 - Similar later generations can be significantly faster.
 - Changing model, shape, reference pattern, LoRA adapter, or chunk layout can trigger new compile passes.
 - Disable it if you prefer predictable speed over maximum throughput.
@@ -268,7 +268,7 @@ Reference audio: none
 | `torch.compile` off | 8.37s | 525 | 20.7s | 21s | 1.01 | 24.95 |
 | `torch.compile` on | 8.32s | 551 | 21.8s | 9s | 0.41 | 57.98 |
 
-In this run, `torch.compile` was about **2.3× faster** during frame generation once active. First-time compilation can still take several minutes to warmup.
+In this run, `torch.compile` was about **2.3× faster** during frame generation once active. First-time compilation can still take up to 5 minutes to warmup.
 
 ---
 
