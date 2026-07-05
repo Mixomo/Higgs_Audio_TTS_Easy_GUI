@@ -36,6 +36,8 @@ The GUI follows a complete local voice workflow:
 
 ### 1. 🎙️ Prep Samples
 
+<img src="./assets/asr.png">
+
 Build a reusable reference voice library.
 
 - Import or record short reference clips.
@@ -48,6 +50,8 @@ Recommended reference clips are usually **5–30 seconds**, clean, single-speake
 ---
 
 ### 2. 🗣️ Inference
+
+<img src="./assets/inference.png">
 
 Generate speech with Higgs V2 or V3.
 
@@ -63,6 +67,8 @@ Long text should use chunking. Every chunk is a separate synthesis pass, so slig
 
 ### 3. 👥 Dialogue / Multi-Speaker
 
+<img src="./assets/dialogue.png">
+
 Create multi-turn generated conversations.
 
 - Add, copy, or delete speaker rows.
@@ -76,6 +82,8 @@ This is useful for podcasts, demos, character testing, and comparing voice refer
 
 ### 4. 📚 Dataset Preparation
 
+<img src="./assets/dataset.png">
+
 Prepare train/eval datasets from local audio folders.
 
 - Supports common audio formats.
@@ -87,6 +95,8 @@ Prepare train/eval datasets from local audio folders.
 ---
 
 ### 5. 🧬 Training / LoRA
+
+<img src="./assets/training.png">
 
 Train or resume LoRA projects.
 
