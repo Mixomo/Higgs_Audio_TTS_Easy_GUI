@@ -1,0 +1,70 @@
+# Local runtime
+.venv*/
+.uv-cache/
+.uv_cache/
+cache/
+logs/
+temp/
+outputs/
+samples/
+voices/
+data/
+exp/
+models/
+config/*.json
+torch_backend.txt
+
+# Local quarantine / manual cleanup markers
+*.delete
+*.delete/
+*.bak
+*.backup
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+* copy.py
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Build / archives
+build/
+dist/
+*.zip
+*.7z
+*.rar
+
+# Upstream reference/demo material not used by this local GUI flow
+train-higgs-audio/.github/
+train-higgs-audio/figures/
+train-higgs-audio/tech_blogs/
+train-higgs-audio/test_demo/
+train-higgs-audio/higgs_training_data_mini/
+train-higgs-audio/tools/
+train-higgs-audio/examples/scene_prompts/
+train-higgs-audio/examples/serve_engine/
+train-higgs-audio/examples/transcript/
+train-higgs-audio/examples/vllm/
+train-higgs-audio/examples/batch_generation.py
+train-higgs-audio/examples/README.md
+train-higgs-audio/*.sh
+train-higgs-audio/README.md
+train-higgs-audio/trainer/README.md
+train-higgs-audio/trainer/trainer.py
+train-higgs-audio/trainer/trainer_ddp.py
+train-higgs-audio/trainer/merger.py
+train-higgs-audio/.gitignore
+train-higgs-audio/.gitmodules
+train-higgs-audio/setup.py
+train-higgs-audio/setup.cfg
+train-higgs-audio/requirements*.txt
+train-higgs-audio/pyproject.toml
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
