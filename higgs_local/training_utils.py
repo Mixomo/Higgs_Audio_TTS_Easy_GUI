@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shutil
@@ -255,9 +256,13 @@ def _read_audio(path: Path) -> tuple[object, int, float]:
 
 
 def _write_wav_mono(src: Path, dst: Path, target_sr: int = 24000) -> float:
-    import librosa
+    from scipy.signal import resample_poly
 
-    audio, sr = librosa.load(str(src), sr=target_sr, mono=True)
+    audio, sr = sf.read(str(src), dtype="float32", always_2d=True)
+    audio = audio.mean(axis=1)
+    if int(sr) != int(target_sr):
+        divisor = math.gcd(int(sr), int(target_sr))
+        audio = resample_poly(audio, int(target_sr) // divisor, int(sr) // divisor)
     sf.write(str(dst), audio, target_sr)
     return float(len(audio)) / float(target_sr) if target_sr else 0.0
 

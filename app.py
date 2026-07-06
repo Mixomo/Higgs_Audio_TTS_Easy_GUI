@@ -8,25 +8,19 @@ import math
 import os
 import re
 import shutil
+import subprocess
 import sys
 import time
 import warnings
 import threading
+import traceback
 from collections import deque
 from datetime import datetime
 from pathlib import Path
 
-if sys.platform.startswith("win"):
-    try:
-        import asyncio
-
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    except Exception:
-        pass
-
 
 def _quiet_asyncio_connection_reset():
-    """Hide harmless browser disconnect noise from Gradio/uvicorn on Windows."""
+    """Hide harmless browser disconnect noise from Gradio/uvicorn."""
     import asyncio
 
     if getattr(asyncio.BaseEventLoop.default_exception_handler, "_higgs_quiet", False):
@@ -43,8 +37,7 @@ def _quiet_asyncio_connection_reset():
     asyncio.BaseEventLoop.default_exception_handler = quiet
 
 
-if sys.platform.startswith("win"):
-    _quiet_asyncio_connection_reset()
+_quiet_asyncio_connection_reset()
 
 APP_ROOT = Path(__file__).resolve().parent
 APP_CACHE = APP_ROOT / "models" / ".cache"
@@ -512,13 +505,12 @@ def notify_done() -> None:
     """Play the completion chime."""
     sound = ROOT / "assets" / "inference_training_done.wav"
     try:
-        if sys.platform.startswith("win"):
-            import winsound
-
-            if sound.exists():
-                winsound.PlaySound(str(sound), winsound.SND_FILENAME | winsound.SND_ASYNC)
-            else:
-                winsound.MessageBeep()
+        if sound.exists():
+            subprocess.Popen(
+                ["aplay", str(sound)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
     except Exception:
         pass
 
@@ -1095,9 +1087,13 @@ def run_dialogue(
         return None, None, message, restore_button("⚡ Generate Dialogue"), gr.update(interactive=False)
 
 
+def voice_dropdown_update_count() -> int:
+    return 2 + DIALOGUE_MAX_SEGMENTS
+
+
 def refresh_voices():
     choices = list_voice_names()
-    return [gr.update(choices=choices, value="None") for _ in range(6)] + [
+    return [gr.update(choices=choices, value="None") for _ in range(voice_dropdown_update_count())] + [
         log(f"Voice library refreshed: {len(choices) - 1} voices.")
     ]
 
@@ -1106,7 +1102,7 @@ def save_sample(audio_path, sample_name, transcript):
     status = save_voice_sample(audio_path, sample_name, transcript)
     notify_done()
     choices = list_voice_names()
-    return [gr.update(choices=choices, value="None") for _ in range(6)] + [log(status)]
+    return [gr.update(choices=choices, value="None") for _ in range(voice_dropdown_update_count())] + [log(status)]
 
 
 def stop_generation():
@@ -1836,7 +1832,9 @@ def prepare_higgs_dataset(
             gr.update(interactive=False),
         )
     except Exception as exc:
-        message = f"Dataset error: {exc}"
+        trace = traceback.format_exc()
+        print(trace, flush=True)
+        message = f"Dataset error: {exc}\n\n{trace}"
         return (
             gr.update(),
             gr.update(),
@@ -2506,12 +2504,12 @@ def build_ui():
                                 ],
                                 value="sdpa",
                                 label="V3 attention backend",
-                                info="SDPA is the supported Windows default for this Higgs V3 Transformers model. Use Eager only as a compatibility fallback.",
+                                info="SDPA is the supported Linux default for this Higgs V3 Transformers model. Use Eager only as a compatibility fallback.",
                             )
                             v3_torch_compile = gr.Checkbox(
                                 label="Enable torch.compile acceleration on next V3 generation",
                                 value=saved_v3_compile,
-                                info="This option can increase the synthesis speed by up to 2.3x. Only available on Nvidia GPUs.",
+                                info="This option can increase synthesis speed after warmup. Only available on Nvidia GPUs.",
                             )
                             gr.Markdown(
                                 "- First synthesis after enabling can take **up to 5 minutes** while kernels compile.\n"
@@ -2722,7 +2720,7 @@ def build_ui():
                     """
                     <div style="background: rgba(234, 179, 8, 0.16); border: 1px solid rgba(234, 179, 8, 0.38); border-radius: 8px; padding: 12px 14px; margin: 14px 0;">
                         <h3 style="margin: 0 0 6px 0; color: #facc15;">🐛 Dev Note:</h3>
-                        <p style="margin: 0;">In the synthesis tests I have been doing, I noticed a <strong>possible bug</strong> which seems <strong>random</strong> on each generation, and I am still not sure about the cause or whether it is <strong>only on my PC</strong>. For some reason, audio generation speed can drop drastically when the CMD window is not focused / in the background. If you also notice the same behavior, I suggest bringing the CMD window to the foreground by clicking on it: that enables the maximum synthesis speed your GPU can provide. To identify this symptom, look at the <strong>XX.XX frames/s</strong> value. If the value is <strong>low</strong>, it means that the synthesis is running <strong>slowly</strong>. If this value <strong>increases dramatically</strong>, it means that the synthesis is running at <strong>maximum speed</strong>.</p>
+                        <p style="margin: 0;">In the synthesis tests I have been doing, I noticed a <strong>possible bug</strong> which seems <strong>random</strong> on each generation, and I am still not sure about the cause or whether it is <strong>only on my PC</strong>. For some reason, audio generation speed can drop drastically when the Bash window is not focused / in the background. If you also notice the same behavior, I suggest bringing the Bash window to the foreground by clicking on it: that enables the maximum synthesis speed your GPU can provide. To identify this symptom, look at the <strong>XX.XX frames/s</strong> value. If the value is <strong>low</strong>, it means that the synthesis is running <strong>slowly</strong>. If this value <strong>increases dramatically</strong>, it means that the synthesis is running at <strong>maximum speed</strong>.</p>
                     </div>
                     """
                 )
@@ -2738,7 +2736,7 @@ def build_ui():
                     with gr.Column(scale=1, elem_classes="form-section"):
                         gr.Markdown("#### 📁 Folder Selection")
                         with gr.Row():
-                            src_folder = gr.Textbox(label="Source Audio Folder", placeholder="J:\\path\\to\\audio_folder", scale=5)
+                            src_folder = gr.Textbox(label="Source Audio Folder", placeholder="/path/to/audio_folder", scale=5)
                             browse_src_folder_btn = gr.Button("Search Folder", scale=1, min_width=130)
                         dataset_name_input = gr.Textbox(label="Dataset Name", placeholder="my_higgs_voice")
                         recursive_dataset = gr.Checkbox(label="Scan subfolders", value=True)
@@ -3293,4 +3291,4 @@ def build_ui():
 
 if __name__ == "__main__":
     _install_cmd_mirror()
-    build_ui().queue(default_concurrency_limit=1).launch(inbrowser=True, css=CSS, js=APP_JS)
+    build_ui().queue(default_concurrency_limit=1).launch(inbrowser=False, css=CSS, js=APP_JS)

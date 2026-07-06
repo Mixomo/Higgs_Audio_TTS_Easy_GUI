@@ -241,11 +241,11 @@ class HiggsV3Engine:
 
             torch._dynamo.config.suppress_errors = True
             self.model.model = torch.compile(self.model.model, dynamic=True)
-            self.compiled = True
             print("[v3-load] torch.compile dynamic enabled.", flush=True)
+            self.compiled = True
         except ModuleNotFoundError as exc:
             if exc.name == "triton":
-                print("[v3-load] torch.compile disabled: Triton is not installed. Run install.bat with a CUDA backend.", flush=True)
+                print("[v3-load] torch.compile disabled: Triton is not installed. Run install.sh with a CUDA backend.", flush=True)
                 return
             print(f"[v3-load] torch.compile unavailable; running uncompiled with selected attention backend ({exc})", flush=True)
         except Exception as exc:

@@ -1,6 +1,6 @@
 # 🗣️ Higgs Audio V2/V3 Simple GUI: Local TTS, Voice Cloning & LoRA Training
 
-A polished Windows WebUI for **local Higgs Audio workflows**: reference voice preparation, Higgs V2/V3 speech generation, Faster-Whisper transcription, dataset building, and LoRA training.
+A polished Linux WebUI for **local Higgs Audio workflows**: reference voice preparation, Higgs V2/V3 speech generation, Faster-Whisper transcription, dataset building, and LoRA training.
 
 ---
 
@@ -116,8 +116,9 @@ This project uses `uv` for fast and reproducible dependency management.
 
 Run from the project folder:
 
-```bat
-install.bat
+```bash
+chmod +x install.sh start.sh
+./install.sh
 ```
 
 The installer will:
@@ -126,7 +127,8 @@ The installer will:
 2. Create the local virtual environment.
 3. Install non-Torch dependencies.
 4. Install the selected PyTorch backend last.
-5. Verify CUDA when a CUDA backend is selected.
+5. Install Triton for CUDA backends.
+6. Verify CUDA when a CUDA backend is selected.
 
 ### PyTorch Backend Options
 
@@ -137,12 +139,11 @@ The installer will:
 | **CUDA 12.6** | NVIDIA RTX 20xx / 30xx. |
 | **CUDA 12.8** | NVIDIA RTX 40xx / 50xx. |
 | **CPU only** | Compatibility mode; slow for TTS/training. |
-| **AMD DirectML** | Experimental Windows AMD path. |
 
 ### Launch
 
-```bat
-start.bat
+```bash
+./start.sh
 ```
 
 Then open:
@@ -157,7 +158,7 @@ http://127.0.0.1:7860
 
 ### Software
 
-- Windows 10/11.
+- Linux.
 - Modern web browser.
 - `uv` package manager.
 - NVIDIA driver compatible with the selected CUDA backend.
@@ -242,7 +243,7 @@ If generation loops, try lowering the repeat count. If speech becomes too clippe
 
 ### Torch Compile
 
-Torch compile is optional and can increase the synthesis speed by up to 2.3x (Nvidia GPU only)
+Torch compile is optional and can increase synthesis speed after warmup (Nvidia GPU only).
 
 - First generation can be slower (take up to 5 minutes) because kernels need warmup.
 - Similar later generations can be significantly faster.

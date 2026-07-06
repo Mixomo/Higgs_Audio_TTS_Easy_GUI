@@ -220,7 +220,7 @@ class TrainingProcessManager:
             message = (
                 "### TensorBoard\nMissing runtime dependency `setuptools`.\n\n"
                 "TensorBoard imports `pkg_resources`, which is provided by setuptools. "
-                "Run `uv pip install setuptools` or rerun `install.bat`."
+                "Run `uv pip install setuptools` or rerun `install.sh`."
             )
             self._append_line("[tensorboard] Missing setuptools/pkg_resources. Run: uv pip install setuptools")
             return message, self.tail_text()
@@ -253,31 +253,12 @@ class TrainingProcessManager:
                 logdir = project_logdir
         url = "http://127.0.0.1:6006"
         tb_cmd = [sys.executable, "-m", "tensorboard.main", "--logdir", str(logdir), "--host", "127.0.0.1", "--port", "6006"]
-        if sys.platform.startswith("win"):
-            launcher = TEMP_DIR / "tensorboard_launch.cmd"
-            launcher.write_text(
-                "@echo off\r\n"
-                "title Higgs Audio TensorBoard\r\n"
-                f"cd /d {subprocess.list2cmdline([str(ROOT)])}\r\n"
-                f"{subprocess.list2cmdline(tb_cmd)}\r\n",
-                encoding="utf-8",
-            )
-            cmd = [
-                os.environ.get("COMSPEC", "cmd.exe"),
-                "/k",
-                str(launcher),
-            ]
-        else:
-            cmd = tb_cmd
+        cmd = tb_cmd
         print("[tensorboard] Command:", subprocess.list2cmdline(cmd), flush=True)
-        if sys.platform.startswith("win"):
-            creationflags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
-        else:
-            creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
         self.tensorboard_process = subprocess.Popen(
             cmd,
             cwd=str(ROOT),
-            creationflags=creationflags,
+            start_new_session=True,
         )
 
         def _open_browser() -> None:

@@ -9,7 +9,7 @@ description = "Local Gradio workspace for Higgs Audio V2/V3 inference, ASR, data
 requires-python = ">=3.10"
 dependencies = [
     "accelerate>=0.26.0",
-    "bitsandbytes; platform_system == 'Windows'",
+    "bitsandbytes; platform_system == 'Linux'",
     "click",
     "dacite",
     "descript-audio-codec",
