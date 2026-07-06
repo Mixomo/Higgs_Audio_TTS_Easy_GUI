@@ -112,6 +112,14 @@ Train or resume LoRA projects.
 
 This project uses `uv` for fast and reproducible dependency management.
 
+### Clone the repository (or download as a .zip archive):
+
+```
+git clone https://github.com/Mixomo/Higgs_Audio_TTS_Easy_GUI.git
+
+cd Higgs_Audio_TTS_Easy_GUI
+```
+
 ### Install
 
 Run from the project folder:
