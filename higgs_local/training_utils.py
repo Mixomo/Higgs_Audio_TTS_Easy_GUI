@@ -12,6 +12,7 @@ from pathlib import Path
 from statistics import median
 from typing import Callable, Iterable
 
+import numpy as np
 import soundfile as sf
 
 from .model_registry import TOKENIZER_MODELS, TTS_MODELS
@@ -255,11 +256,16 @@ def _read_audio(path: Path) -> tuple[object, int, float]:
 
 
 def _write_wav_mono(src: Path, dst: Path, target_sr: int = 24000) -> float:
-    import librosa
-
-    audio, sr = librosa.load(str(src), sr=target_sr, mono=True)
-    sf.write(str(dst), audio, target_sr)
-    return float(len(audio)) / float(target_sr) if target_sr else 0.0
+    audio, sr, _ = _read_audio(src)
+    mono = np.asarray(audio, dtype=np.float32).mean(axis=1)
+    if sr != target_sr and len(mono):
+        src_x = np.linspace(0.0, 1.0, num=len(mono), endpoint=False)
+        dst_len = max(1, int(round(len(mono) * float(target_sr) / float(sr))))
+        dst_x = np.linspace(0.0, 1.0, num=dst_len, endpoint=False)
+        mono = np.interp(dst_x, src_x, mono).astype(np.float32)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    sf.write(str(dst), mono, target_sr)
+    return float(len(mono)) / float(target_sr) if target_sr else 0.0
 
 
 def _sidecar_transcript(audio_path: Path) -> str:

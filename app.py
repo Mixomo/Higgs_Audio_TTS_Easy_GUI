@@ -1836,7 +1836,10 @@ def prepare_higgs_dataset(
             gr.update(interactive=False),
         )
     except Exception as exc:
-        message = f"Dataset error: {exc}"
+        import traceback
+
+        message = f"Dataset error: {exc}\n\n{traceback.format_exc()}"
+        print(message, flush=True)
         return (
             gr.update(),
             gr.update(),
