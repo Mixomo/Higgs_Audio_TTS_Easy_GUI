@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -85,6 +86,25 @@ def _load_waveform(path: Path, target_sr: int = 24000) -> tuple[torch.Tensor, in
     return wav.squeeze(0), int(sr)
 
 
+def _audio_code_cache_path(cache_dir: Path, audio_path: Path, sample_rate: int) -> Path:
+    key = f"{audio_path.resolve()}|{audio_path.stat().st_mtime_ns}|{audio_path.stat().st_size}|{int(sample_rate)}"
+    return cache_dir / f"{hashlib.sha1(key.encode('utf-8')).hexdigest()}.pt"
+
+
+def _cached_audio_codes(model, audio_path: Path, sample_rate: int, cache_dir: Path) -> torch.Tensor:
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = _audio_code_cache_path(cache_dir, audio_path, sample_rate)
+    if cache_path.exists():
+        payload = torch.load(cache_path, map_location="cpu", weights_only=False)
+        codes = payload.get("codes") if isinstance(payload, dict) else payload
+        if isinstance(codes, torch.Tensor):
+            return codes.to(torch.long)
+    wav, sr = _load_waveform(audio_path, target_sr=sample_rate)
+    codes = model._encode_reference(wav, sr).to(torch.long).cpu()
+    torch.save({"codes": codes}, cache_path)
+    return codes
+
+
 def _sample_paths(data_dir: Path, sample: dict) -> tuple[Path, Path]:
     audio = data_dir / sample.get("audio_file", "")
     transcript = data_dir / sample.get("transcript_file", "")
@@ -122,6 +142,14 @@ def _apply_lora(model, rank: int, alpha: int, dropout: float):
 def _load_lora(model, adapter_dir: Path):
     print(f"[v3-train] Resuming Qwen3 LoRA adapter from {adapter_dir}", flush=True)
     model.model = PeftModel.from_pretrained(model.model, str(adapter_dir), is_trainable=True)
+    modules_path = adapter_dir / "higgs_v3_audio_modules.pt"
+    if modules_path.exists():
+        modules = torch.load(modules_path, map_location="cpu", weights_only=False)
+        if "audio_embedding" in modules:
+            model.audio_embedding.load_state_dict(modules["audio_embedding"], strict=False)
+        if "audio_head" in modules:
+            model.audio_head.load_state_dict(modules["audio_head"], strict=False)
+        print(f"[v3-train] Restored V3 audio modules from {modules_path}", flush=True)
     return model
 
 
@@ -204,6 +232,7 @@ def train(args: argparse.Namespace) -> None:
     eval_dir = Path(args.eval_data_dir) if args.eval_data_dir else None
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    code_cache_dir = output_dir / "audio_code_cache"
     resume_dir = Path(args.resume_checkpoint) if args.resume_checkpoint else None
 
     if args.task_type not in SUPPORTED_TASKS:
@@ -221,6 +250,7 @@ def train(args: argparse.Namespace) -> None:
     torch.set_float32_matmul_precision("high")
     print(f"[v3-train] device={device} dtype={dtype}", flush=True)
     print(f"[v3-train] train={len(train_samples)} eval={len(eval_samples)} task={args.task_type}", flush=True)
+    print(f"[v3-train] audio_code_cache={code_cache_dir}", flush=True)
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(args.model_path, trust_remote_code=True, dtype=dtype)
@@ -288,15 +318,18 @@ def train(args: argparse.Namespace) -> None:
             for sample in batch:
                 audio_path, transcript_path = _sample_paths(train_dir, sample)
                 text = normalize_transcript(transcript_path.read_text(encoding="utf-8", errors="ignore"), convert_v2_tags=False)
-                wav, sr = _load_waveform(audio_path, target_sr=int(model.config.sample_rate))
+                target_codes = _cached_audio_codes(model, audio_path, int(model.config.sample_rate), code_cache_dir)
                 ref_wav, ref_sr, ref_text = _reference_for_sample(train_dir, sample, args.task_type)
+                ref_codes = None
+                if ref_wav is not None:
+                    ref_path = train_dir / sample.get("ref_audio_file", "")
+                    ref_codes = _cached_audio_codes(model, ref_path, int(model.config.sample_rate), code_cache_dir)
                 loss, stats = compute_v3_audio_code_loss(
                     model,
                     tokenizer,
                     text=text,
-                    target_audio=wav,
-                    target_sample_rate=sr,
-                    reference_audio=ref_wav,
+                    target_codes=target_codes,
+                    reference_codes=ref_codes,
                     reference_sample_rate=ref_sr,
                     reference_text=ref_text,
                 )
@@ -389,18 +422,22 @@ def evaluate(model, tokenizer, eval_dir: Path, eval_samples: list[dict], args: a
     was_training = model.training
     model.eval()
     losses = []
+    cache_dir = Path(args.output_dir) / "audio_code_cache"
     for sample in eval_samples:
         audio_path, transcript_path = _sample_paths(eval_dir, sample)
         text = normalize_transcript(transcript_path.read_text(encoding="utf-8", errors="ignore"))
-        wav, sr = _load_waveform(audio_path, target_sr=int(model.config.sample_rate))
+        target_codes = _cached_audio_codes(model, audio_path, int(model.config.sample_rate), cache_dir)
         ref_wav, ref_sr, ref_text = _reference_for_sample(eval_dir, sample, args.task_type)
+        ref_codes = None
+        if ref_wav is not None:
+            ref_path = eval_dir / sample.get("ref_audio_file", "")
+            ref_codes = _cached_audio_codes(model, ref_path, int(model.config.sample_rate), cache_dir)
         loss, _ = compute_v3_audio_code_loss(
             model,
             tokenizer,
             text=text,
-            target_audio=wav,
-            target_sample_rate=sr,
-            reference_audio=ref_wav,
+            target_codes=target_codes,
+            reference_codes=ref_codes,
             reference_sample_rate=ref_sr,
             reference_text=ref_text,
         )
@@ -413,10 +450,18 @@ def evaluate(model, tokenizer, eval_dir: Path, eval_samples: list[dict], args: a
 def save_checkpoint(model, tokenizer, output_dir: Path, lora_only: bool) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     if lora_only and hasattr(model.model, "save_pretrained"):
-        model.model.save_pretrained(str(output_dir / "qwen3_lora"))
+        adapter_dir = output_dir / "qwen3_lora"
+        model.model.save_pretrained(str(adapter_dir))
+        torch.save(
+            {
+                "audio_embedding": model.audio_embedding.state_dict(),
+                "audio_head": model.audio_head.state_dict(),
+            },
+            adapter_dir / "higgs_v3_audio_modules.pt",
+        )
         tokenizer.save_pretrained(str(output_dir))
         (output_dir / "adapter_note.txt").write_text(
-            "Custom Higgs V3 adapter: load the base V3 model, then attach qwen3_lora to model.model.\n",
+            "Custom Higgs V3 adapter: load the base V3 model, attach qwen3_lora to model.model, then restore higgs_v3_audio_modules.pt when present.\n",
             encoding="utf-8",
         )
     else:
