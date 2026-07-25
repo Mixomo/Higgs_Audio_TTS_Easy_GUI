@@ -262,6 +262,16 @@ class HiggsV3Engine:
             raise RuntimeError(f"PEFT is required to load V3 LoRA adapters: {exc}") from exc
         print(f"[v3-adapter] Loading LoRA adapter: {adapter_path}", flush=True)
         self.model.model = PeftModel.from_pretrained(self.model.model, str(adapter_path))
+        modules_path = adapter_path / "higgs_v3_audio_modules.pt"
+        if modules_path.exists():
+            import torch
+
+            modules = torch.load(modules_path, map_location="cpu", weights_only=False)
+            if "audio_embedding" in modules:
+                self.model.audio_embedding.load_state_dict(modules["audio_embedding"], strict=False)
+            if "audio_head" in modules:
+                self.model.audio_head.load_state_dict(modules["audio_head"], strict=False)
+            print(f"[v3-adapter] Restored V3 audio modules: {modules_path}", flush=True)
         self.loaded_adapter_path = str(adapter_path)
 
     def _precision(self, device: str) -> str:

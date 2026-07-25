@@ -28,6 +28,12 @@ A polished Linux WebUI for **local Higgs Audio workflows**: reference voice prep
 
 At the time this GUI was built, there is no official public Higgs V3 TTS fine-tuning guide or trainer equivalent to a mature supervised LoRA workflow. This app exposes an experimental V3 training path by adapting the available Higgs-style supervised workflow to the local V3 Transformers runtime.
 
+The included V3 trainer uses teacher-forced cross entropy over delayed 8-codebook audio tokens. The following practical improvements were adapted from [tuanh123789/Higgs-tts-3-finetune](https://github.com/tuanh123789/Higgs-tts-3-finetune):
+
+- **Audio-code cache:** target/reference WAV files are encoded once and cached under `exp/<project>/audio_code_cache`, so later epochs, eval passes, and resumed runs do not waste time re-tokenizing the same audio.
+
+- **V3 audio module persistence:** `audio_embedding` and `audio_head` are saved beside `qwen3_lora` as `higgs_v3_audio_modules.pt` and restored during inference/resume when present. This can make inference more faithful to the training/eval sound, because the adapter is loaded with the same V3 audio helper layers that were present during training instead of only the Qwen LoRA weights. It does not guarantee higher quality in every case, but it reduces one source of mismatch between training eval and later inference.
+
 ---
 
 ## 🔄 Application Workflow
@@ -300,6 +306,7 @@ Built for local use around:
 
 - [Boson AI Higgs Audio](https://github.com/boson-ai/higgs-audio)
 - [Train Higgs Audio repo](https://github.com/JimmyMa99/train-higgs-audio)
+- [tuanh123789/Higgs-tts-3-finetune](https://github.com/tuanh123789/Higgs-tts-3-finetune)
 - [Faster-Whisper / CTranslate2](https://github.com/SYSTRAN/faster-whisper)
 
 GUI layout and workflow inspired by [FranckyB](https://github.com/FranckyB) [Voice Clone Studio](https://github.com/FranckyB/Voice-Clone-Studio)
