@@ -499,6 +499,7 @@ def build_higgs_dataset(
     val_split: float = 0.1,
     recursive: bool = True,
     progress: Callable[[float | tuple[int, int], str], None] | None = None,
+    audio_options=None,
 ) -> DatasetSummary:
     source = Path(source_folder)
     if not source.exists() or not source.is_dir():
@@ -541,12 +542,41 @@ def build_higgs_dataset(
     }.get(language, language[:2].lower() if language else "unknown")
     speaker_id = f"{dataset_slug}_speaker"
     speaker_name = dataset_slug.replace("_", " ").title()
+
+    # Optional front-end: isolate the voice and cut natural segments. Files that
+    # already have a transcript are cleaned but kept whole so text stays aligned.
+    clip_sources: dict[Path, tuple[Path, float, float]] = {}
+    clip_sidecars: dict[Path, str] = {}
+    staging_dir = dataset_dir / "_clips"
+    if audio_options is not None and (audio_options.isolate or audio_options.segment):
+        from .dataset_audio import DatasetAudioProcessor
+
+        processor = DatasetAudioProcessor()
+        try:
+            clips = processor.process_sources(
+                audio_paths, staging_dir, audio_options, keep_whole=_sidecar_exists, progress=progress
+            )
+        finally:
+            processor.unload()
+        if not clips:
+            raise RuntimeError("Voice isolation / segmentation produced no usable clips.")
+        for clip in clips:
+            clip_sources[clip.path] = (clip.source, clip.start, clip.end)
+            if _sidecar_exists(clip.source):
+                clip_sidecars[clip.path] = _sidecar_transcript(clip.source)
+        print(
+            f"[dataset] Front-end: {len(audio_paths)} source file(s) -> {len(clips)} clip(s), "
+            f"{sum(c.duration for c in clips) / 60:.1f} min of speech",
+            flush=True,
+        )
+        audio_paths = [clip.path for clip in clips]
+
     transcripts: dict[Path, str] = {}
     missing_transcripts: list[Path] = []
     for idx, audio_path in enumerate(audio_paths, 1):
         if progress:
             progress((idx - 1, len(audio_paths)), f"Scanning {audio_path.name}")
-        transcript = _sidecar_transcript(audio_path)
+        transcript = clip_sidecars.get(audio_path) or _sidecar_transcript(audio_path)
         if transcript:
             transcripts[audio_path] = transcript
         else:
@@ -595,6 +625,7 @@ def build_higgs_dataset(
         transcript_filename = f"{sample_id}.txt"
         duration = _write_wav_mono(audio_path, out_dir / audio_filename)
         (out_dir / transcript_filename).write_text(transcript, encoding="utf-8")
+        origin = clip_sources.get(audio_path)
         sample = _sample_metadata(
             sample_id,
             audio_filename,
@@ -603,9 +634,12 @@ def build_higgs_dataset(
             speaker_id,
             speaker_name,
             lang_code,
-            str(audio_path.resolve()),
+            str((origin[0] if origin else audio_path).resolve()),
             split,
         )
+        if origin:
+            sample["source_start"] = round(origin[1], 3)
+            sample["source_end"] = round(origin[2], 3)
         sample["training_task_type"] = dataset_task_type
         if dataset_task_type == "zero_shot_voice_cloning":
             sample["ref_audio_file"] = eval_ref_audio if split == "eval" else train_ref_audio
@@ -624,6 +658,7 @@ def build_higgs_dataset(
             train_samples.append(sample)
         kept += 1
 
+    shutil.rmtree(staging_dir, ignore_errors=True)
     if not train_samples:
         raise RuntimeError("No valid train samples were created.")
     if not eval_samples:
@@ -845,6 +880,20 @@ def build_v3_training_command(
     enable_eval_audio: bool = False,
     eval_text: str = "",
     eval_audio_max_new_tokens: int = 1000,
+    lora_alpha: int = 0,
+    lr_scheduler: str = "cosine",
+    warmup_ratio: float = 0.05,
+    weight_decay: float = 0.01,
+    audio_lr_scale: float = 0.1,
+    gradient_checkpointing: bool = False,
+    max_audio_seconds: float = 30.0,
+    optimizer: str = "adamw",
+    prodigy_d_coef: float = 1.0,
+    early_stop_patience: int = 3,
+    early_stop_min_delta: float = 0.002,
+    restore_best: bool = True,
+    max_batch_seconds: float = 40.0,
+    eval_seed: int = 1234,
 ) -> tuple[list[str], str]:
     if task_type not in {"single_speaker_smart_voice", "zero_shot_voice_cloning"}:
         raise ValueError("Custom V3 trainer currently supports single_speaker_smart_voice and zero_shot_voice_cloning only.")
@@ -882,8 +931,35 @@ def build_v3_training_command(
         "--lora_rank",
         str(int(lora_rank)),
         "--lora_alpha",
-        str(int(lora_rank) * 2),
+        str(int(lora_alpha) if int(lora_alpha or 0) > 0 else int(lora_rank) * 2),
+        "--lr_scheduler",
+        str(lr_scheduler or "cosine"),
+        "--warmup_ratio",
+        str(float(warmup_ratio)),
+        "--weight_decay",
+        str(float(weight_decay)),
+        "--audio_lr_scale",
+        str(float(audio_lr_scale)),
+        "--max_audio_seconds",
+        str(float(max_audio_seconds)),
+        "--save_best",
+        "--optimizer",
+        str(optimizer or "adamw"),
+        "--prodigy_d_coef",
+        str(float(prodigy_d_coef)),
+        "--early_stop_patience",
+        str(int(early_stop_patience)),
+        "--early_stop_min_delta",
+        str(float(early_stop_min_delta)),
+        "--max_batch_seconds",
+        str(float(max_batch_seconds)),
+        "--eval_seed",
+        str(int(eval_seed)),
     ]
+    if restore_best:
+        args.append("--restore_best")
+    if gradient_checkpointing:
+        args.append("--gradient_checkpointing")
     if eval_dir:
         args.extend(["--eval_data_dir", str(eval_dir)])
     if max_steps > 0:
@@ -903,5 +979,43 @@ def build_v3_training_command(
     if freeze_audio_head:
         args.append("--freeze_audio_head")
     pretty = subprocess.list2cmdline(args)
-    pretty += f"\n\n# Custom Higgs V3 trainer: teacher-forced CE over delayed 8-codebook audio rows. Effective batch: {int(batch_size)} x grad_accum {int(grad_accum)}. The project root is kept as latest; checkpoint-* folders keep snapshots. LoRA adapters are saved as qwen3_lora with optimizer, scheduler, RNG, and optimizer_step."
+    pretty += f"\n\n# Custom Higgs V3 trainer: padded-batch teacher-forced CE over delayed 8-codebook rows (BOC masked), {lr_scheduler} LR with {warmup_ratio:g} warmup; best eval kept in checkpoint-best. Effective batch: {int(batch_size)} x grad_accum {int(grad_accum)}. The project root is kept as latest; checkpoint-* folders keep snapshots. LoRA adapters are saved as qwen3_lora with optimizer, scheduler, RNG, and optimizer_step."
     return args, pretty
+
+
+# Artifacts a training run writes into exp/<project>. A fresh run (no resume)
+# removes the previous run's ones so dropdowns only show the new run; the
+# codec-code cache is content-addressed and is kept to speed up the new run.
+_RUN_ARTIFACTS = (
+    "qwen3_lora",
+    "lora_adapter",
+    "trainer_state.pt",
+    "eval_audio",
+    "tensorboard",
+    "adapter_note.txt",
+    "run_info.json",
+    "metrics.jsonl",
+)
+
+
+def reset_project_for_fresh_run(output_name: str, default_name: str) -> list[str]:
+    """Delete the previous run's checkpoints/adapters in ``exp/<project>``."""
+    from .adapters import mark_new_run
+
+    project_dir = ROOT / "exp" / slugify(output_name, default_name)
+    removed: list[str] = []
+    if project_dir.exists():
+        targets = [p for p in project_dir.glob("checkpoint-*") if p.is_dir()]
+        targets += [project_dir / name for name in _RUN_ARTIFACTS]
+        for path in targets:
+            if not path.exists():
+                continue
+            if path.is_dir():
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                path.unlink(missing_ok=True)
+            removed.append(path.name)
+    mark_new_run(project_dir)
+    if removed:
+        print(f"[training] Fresh run in {project_dir.name}: removed previous run artifacts: {', '.join(sorted(removed))}", flush=True)
+    return removed

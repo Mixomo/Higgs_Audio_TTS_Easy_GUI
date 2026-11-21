@@ -60,30 +60,23 @@ PROCESSOR_MODELS: dict[str, ModelSpec] = {
 
 HIGGS_ASR_MODELS: dict[str, ModelSpec] = {}
 
+# CrisperWhisper 2.0 (nyralabs): verbatim Whisper fine-tunes with sharp word timing.
+# Weights are under the "nyra-health-non-commercial-research" license.
 WHISPER_MODELS: dict[str, ModelSpec] = {
-    "Faster-Whisper tiny": ModelSpec("Faster-Whisper tiny", "Systran/faster-whisper-tiny", "faster-whisper-tiny", "asr"),
-    "Faster-Whisper base": ModelSpec("Faster-Whisper base", "Systran/faster-whisper-base", "faster-whisper-base", "asr"),
-    "Faster-Whisper small": ModelSpec("Faster-Whisper small", "Systran/faster-whisper-small", "faster-whisper-small", "asr"),
-    "Faster-Whisper medium": ModelSpec("Faster-Whisper medium", "Systran/faster-whisper-medium", "faster-whisper-medium", "asr"),
-    "Faster-Whisper large-v2": ModelSpec(
-        "Faster-Whisper large-v2",
-        "Systran/faster-whisper-large-v2",
-        "faster-whisper-large-v2",
-        "asr",
+    "CrisperWhisper 2.0 large": ModelSpec(
+        "CrisperWhisper 2.0 large", "nyralabs/CrisperWhisper2.0_large", "crisperwhisper2.0-large", "asr"
     ),
-    "Faster-Whisper large-v3": ModelSpec(
-        "Faster-Whisper large-v3",
-        "Systran/faster-whisper-large-v3",
-        "faster-whisper-large-v3",
-        "asr",
+    "CrisperWhisper 2.0 turbo": ModelSpec(
+        "CrisperWhisper 2.0 turbo", "nyralabs/CrisperWhisper2.0_turbo", "crisperwhisper2.0-turbo", "asr"
     ),
-    "Faster-Whisper distil-large-v3": ModelSpec(
-        "Faster-Whisper distil-large-v3",
-        "Systran/faster-distil-whisper-large-v3",
-        "faster-distil-whisper-large-v3",
-        "asr",
+    "CrisperWhisper 2.0 medium": ModelSpec(
+        "CrisperWhisper 2.0 medium", "nyralabs/CrisperWhisper2.0_medium", "crisperwhisper2.0-medium", "asr"
+    ),
+    "CrisperWhisper 2.0 small": ModelSpec(
+        "CrisperWhisper 2.0 small", "nyralabs/CrisperWhisper2.0_small", "crisperwhisper2.0-small", "asr"
     ),
 }
+DEFAULT_ASR_MODEL = "CrisperWhisper 2.0 large"
 
 ASR_MODELS: dict[str, ModelSpec] = dict(WHISPER_MODELS)
 
@@ -159,8 +152,8 @@ def install_default_models(include_asr: bool = True) -> list[str]:
         ensure_model(spec)
         installed.append(f"{spec.label}: {spec.local_dir}")
     if include_asr:
-        ensure_model(WHISPER_MODELS["Faster-Whisper large-v3"])
-        installed.append(f"Faster-Whisper large-v3: {WHISPER_MODELS['Faster-Whisper large-v3'].local_dir}")
+        ensure_model(WHISPER_MODELS[DEFAULT_ASR_MODEL])
+        installed.append(f"{DEFAULT_ASR_MODEL}: {WHISPER_MODELS[DEFAULT_ASR_MODEL].local_dir}")
     return installed
 
 
@@ -169,7 +162,7 @@ def describe_models() -> str:
         ("TTS", TTS_MODELS.values()),
         ("Tokenizer", TOKENIZER_MODELS.values()),
         ("Processor", PROCESSOR_MODELS.values()),
-        ("Faster-Whisper ASR", WHISPER_MODELS.values()),
+        ("CrisperWhisper ASR", WHISPER_MODELS.values()),
     ]
     lines = []
     for title, specs in groups:

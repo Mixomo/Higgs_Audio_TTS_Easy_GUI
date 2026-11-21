@@ -31,5 +31,5 @@ set "NUMEXPR_NUM_THREADS=%HIGGS_CPU_THREADS%"
 
 for %%D in ("%TEMP%" "%HF_HOME%" "%TORCH_HOME%" "%XDG_CACHE_HOME%" "%UV_CACHE_DIR%" "%HF_MODULES_CACHE%") do if not exist %%D mkdir %%D
 
-uv run --no-sync python app.py
+uv run --no-sync python -u app.py
 pause

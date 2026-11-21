@@ -108,6 +108,9 @@ def split_long_text(text: str, mode: str) -> list[str]:
         return [text]
     if mode == "Paragraph/Sentence Auto":
         return paragraph_sentence_split(text)
+    if mode == "Seamless (auto)":
+        # ~300 chars keeps each Higgs V3 pass under ~25 s, where it stays accurate.
+        return paragraph_sentence_split(text, max_chars=300)
     if mode == "Periods":
         return split_by_periods(text)
     if mode == "Paragraphs":

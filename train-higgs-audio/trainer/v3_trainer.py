@@ -6,6 +6,7 @@ import json
 import math
 import os
 import random
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -24,7 +25,7 @@ from tqdm.auto import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from higgs_local.training_utils import normalize_transcript
-from higgs_local.v3_training_loss import compute_v3_audio_code_loss
+from higgs_local.v3_training_loss import V3Example, compute_v3_batch_loss
 
 
 SUPPORTED_TASKS = {"single_speaker_smart_voice", "zero_shot_voice_cloning"}
@@ -172,6 +173,7 @@ def save_training_state(out_dir: Path, optimizer, scheduler, optimizer_step: int
         "optimizer_step": int(optimizer_step),
         "micro_step": int(micro_step),
         "step_semantics": "optimizer_step",
+        "optimizer_name": getattr(args, "optimizer", "adamw"),
         "torch_rng_state": torch.get_rng_state(),
         "cuda_rng_state_all": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
         "python_rng_state": random.getstate(),
@@ -186,9 +188,19 @@ def load_training_state(checkpoint_dir: Path, optimizer, scheduler=None) -> tupl
         print(f"[v3-train] No trainer_state.pt found in {checkpoint_dir}; adapter/model weights only.", flush=True)
         return 0, 0
     state = torch.load(state_path, map_location="cpu", weights_only=False)
-    optimizer.load_state_dict(state["optimizer"])
-    if scheduler is not None and state.get("scheduler") is not None:
-        scheduler.load_state_dict(state["scheduler"])
+    saved_name = state.get("optimizer_name", "adamw")
+    current_name = type(optimizer).__name__.lower()
+    expected = {"adamw": "adamw", "prodigy": "prodigy", "prodigy_sf": "prodigyplusschedulefree"}.get(saved_name, saved_name)
+    if expected != current_name:
+        print(
+            f"[v3-train] Checkpoint was trained with {saved_name}; optimizer is now {current_name}. "
+            "Keeping the weights and step count, starting fresh optimizer state.",
+            flush=True,
+        )
+    else:
+        optimizer.load_state_dict(state["optimizer"])
+        if scheduler is not None and state.get("scheduler") is not None:
+            scheduler.load_state_dict(state["scheduler"])
     if state.get("torch_rng_state") is not None:
         torch.set_rng_state(state["torch_rng_state"])
     if torch.cuda.is_available() and state.get("cuda_rng_state_all") is not None:
@@ -204,18 +216,29 @@ def load_training_state(checkpoint_dir: Path, optimizer, scheduler=None) -> tupl
     return optimizer_step, micro_step
 
 
-def generate_eval_audio(model, tokenizer, text: str, out_wav: Path, max_new_tokens: int = 1000) -> tuple[int, np.ndarray]:
+def generate_eval_audio(
+    model, tokenizer, text: str, out_wav: Path, max_new_tokens: int = 1000, seed: int = 1234
+) -> tuple[int, np.ndarray]:
+    """Same text + same seed at every eval, so previews differ only by training."""
     was_training = model.training
     model.eval()
-    with torch.no_grad():
-        audio = model.generate_speech(
-            text.strip() or "This is a Higgs V3 training preview.",
-            tokenizer,
-            max_new_tokens=int(max_new_tokens),
-            temperature=0.8,
-            top_p=0.95,
-            top_k=50,
-        )
+    cpu_state = torch.get_rng_state()
+    cuda_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    torch.manual_seed(int(seed))
+    try:
+        with torch.no_grad():
+            audio = model.generate_speech(
+                text.strip() or "This is a Higgs V3 training preview.",
+                tokenizer,
+                max_new_tokens=int(max_new_tokens),
+                temperature=0.8,
+                top_p=0.95,
+                top_k=50,
+            )
+    finally:
+        torch.set_rng_state(cpu_state)
+        if cuda_state is not None:
+            torch.cuda.set_rng_state_all(cuda_state)
     out_wav.parent.mkdir(parents=True, exist_ok=True)
     audio_np = audio.detach().float().cpu().numpy().astype(np.float32)
     sr = int(getattr(model.config, "sample_rate", 24000))
@@ -223,6 +246,166 @@ def generate_eval_audio(model, tokenizer, text: str, out_wav: Path, max_new_toke
     if was_training:
         model.train()
     return sr, audio_np
+
+
+def _sample_duration(sample: dict) -> float:
+    try:
+        return float(sample.get("duration") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _filter_by_duration(samples: list[dict], args: argparse.Namespace, label: str) -> list[dict]:
+    kept = [s for s in samples if args.min_audio_seconds <= _sample_duration(s) <= args.max_audio_seconds or _sample_duration(s) == 0.0]
+    dropped = len(samples) - len(kept)
+    if dropped:
+        print(
+            f"[v3-train] {label}: skipped {dropped} clip(s) outside {args.min_audio_seconds:g}-{args.max_audio_seconds:g}s "
+            "(long clips risk OOM and Higgs V3 reads ~25 s per pass at most)",
+            flush=True,
+        )
+    return kept
+
+
+def _length_grouped_batches(samples: list[dict], batch_size: int, max_batch_seconds: float = 0.0) -> list[list[dict]]:
+    """Shuffle, then sort inside mega-batches by duration so batches pad little.
+
+    ``max_batch_seconds`` caps the audio per micro-batch: groups of long clips get
+    fewer samples, so length grouping can never stack e.g. 4 x 15 s into one OOM.
+    """
+    order = samples[:]
+    random.shuffle(order)
+    mega = max(batch_size * 16, batch_size)
+    batches: list[list[dict]] = []
+    for i in range(0, len(order), mega):
+        chunk = sorted(order[i : i + mega], key=_sample_duration)
+        current: list[dict] = []
+        for sample in chunk:
+            longest = max([_sample_duration(s) for s in current] + [_sample_duration(sample)])
+            too_much = max_batch_seconds > 0 and current and longest * (len(current) + 1) > max_batch_seconds
+            if len(current) >= batch_size or too_much:
+                batches.append(current)
+                current = []
+            current.append(sample)
+        if current:
+            batches.append(current)
+    random.shuffle(batches)
+    return batches
+
+
+def _make_example(model, data_dir: Path, sample: dict, args: argparse.Namespace, cache_dir: Path) -> V3Example:
+    audio_path, transcript_path = _sample_paths(data_dir, sample)
+    # Same normalisation for train and eval: V3 keeps its own inline tags.
+    text = normalize_transcript(transcript_path.read_text(encoding="utf-8", errors="ignore"), convert_v2_tags=False)
+    sr = int(model.config.sample_rate)
+    codes = _cached_audio_codes(model, audio_path, sr, cache_dir)
+    ref_codes = None
+    ref_text = None
+    if args.task_type == "zero_shot_voice_cloning":
+        ref_name = sample.get("ref_audio_file")
+        if not ref_name:
+            raise ValueError(f"zero_shot_voice_cloning sample has no ref_audio_file: {sample.get('id', 'unknown')}")
+        ref_codes = _cached_audio_codes(model, data_dir / ref_name, sr, cache_dir)
+        ref_text = sample.get("ref_transcript") or ""
+    return V3Example(text=text, target_codes=codes, reference_codes=ref_codes, reference_text=ref_text)
+
+
+def _lr_lambda(args: argparse.Namespace, total_updates: int):
+    warmup = int(math.ceil(total_updates * max(args.warmup_ratio, 0.0))) if args.warmup_steps < 0 else int(args.warmup_steps)
+    floor = min(max(args.min_lr_ratio, 0.0), 1.0)
+
+    def fn(step: int) -> float:
+        if warmup > 0 and step < warmup:
+            return (step + 1) / float(warmup)
+        if args.lr_scheduler == "constant":
+            return 1.0
+        progress = min(max((step - warmup) / float(max(total_updates - warmup, 1)), 0.0), 1.0)
+        if args.lr_scheduler == "linear":
+            return floor + (1.0 - floor) * (1.0 - progress)
+        return floor + (1.0 - floor) * 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    return fn, warmup
+
+
+def _param_groups(model, args: argparse.Namespace) -> list[dict]:
+    audio_ids = {id(p) for m in (model.audio_embedding, model.audio_head) for p in m.parameters()}
+    lora, audio, other = [], [], []
+    seen: set[int] = set()
+    for name, p in model.named_parameters():
+        if not p.requires_grad or id(p) in seen:
+            continue
+        seen.add(id(p))
+        if id(p) in audio_ids:
+            audio.append(p)
+        elif "lora_" in name:
+            lora.append(p)
+        else:
+            other.append(p)
+    groups = []
+    if lora:
+        groups.append({"params": lora, "lr": args.learning_rate, "weight_decay": args.weight_decay, "name": "lora"})
+    if other:
+        groups.append({"params": other, "lr": args.learning_rate, "weight_decay": args.weight_decay, "name": "backbone"})
+    if audio:
+        # The tied codec embedding/head is shared by every voice: move it gently.
+        groups.append({"params": audio, "lr": args.learning_rate * args.audio_lr_scale, "weight_decay": 0.0, "name": "audio_modules"})
+    for g in groups:
+        print(f"[v3-train] param group {g['name']}: {sum(p.numel() for p in g['params']):,} params, lr={g['lr']:.2e}, wd={g['weight_decay']}", flush=True)
+    return groups
+
+
+def _build_optimizer(model, args: argparse.Namespace):
+    """AdamW (measured recipe), Prodigy, or Prodigy Plus Schedule-Free.
+
+    Prodigy estimates the LR scale ``d`` online (``lr`` stays 1.0 and the cosine
+    schedule only shapes it); it needs one shared lr across groups, so a trained
+    codec embedding uses the same scale. Schedule-Free needs no LR schedule and
+    keeps averaged weights that must be swapped in (``optimizer.eval()``) before
+    evaluating or saving.
+    """
+    groups = _param_groups(model, args)
+    name = args.optimizer
+    if name == "adamw":
+        return AdamW(groups, betas=(0.9, 0.95), eps=1e-8)
+    for g in groups:
+        g["lr"] = 1.0
+    if name == "prodigy":
+        from prodigyopt import Prodigy
+
+        if any(g.get("name") == "audio_modules" for g in groups):
+            print("[v3-train] Prodigy uses one LR scale for all groups: --audio_lr_scale is ignored.", flush=True)
+        return Prodigy(
+            groups,
+            lr=1.0,
+            betas=(0.9, 0.99),
+            weight_decay=args.weight_decay,
+            decouple=True,
+            use_bias_correction=True,
+            safeguard_warmup=True,
+            d_coef=args.prodigy_d_coef,
+            d0=args.prodigy_d0,
+        )
+    if name == "prodigy_sf":
+        from prodigyplus.prodigy_plus_schedulefree import ProdigyPlusScheduleFree
+
+        return ProdigyPlusScheduleFree(
+            groups,
+            lr=1.0,
+            betas=(0.9, 0.99),
+            weight_decay=args.weight_decay,
+            d_coef=args.prodigy_d_coef,
+            d0=args.prodigy_d0,
+            split_groups=True,
+            use_stableadamw=True,
+            use_schedulefree=True,
+        )
+    raise ValueError(f"Unknown optimizer: {name}")
+
+
+def _effective_lr(optimizer) -> float:
+    """lr x d for Prodigy-family optimizers (their lr is a 1.0 multiplier)."""
+    group = optimizer.param_groups[0]
+    return float(group["lr"]) * float(group.get("d", 1.0))
 
 
 def train(args: argparse.Namespace) -> None:
@@ -238,18 +421,21 @@ def train(args: argparse.Namespace) -> None:
     if args.task_type not in SUPPORTED_TASKS:
         raise ValueError(f"Custom V3 trainer supports {sorted(SUPPORTED_TASKS)}, got {args.task_type}")
 
-    train_samples = _load_samples(train_dir)
-    eval_samples = _load_samples(eval_dir) if eval_dir else []
+    train_samples = _filter_by_duration(_load_samples(train_dir), args, "train")
+    eval_samples = _filter_by_duration(_load_samples(eval_dir), args, "eval") if eval_dir else []
     if args.max_train_samples > 0:
         train_samples = train_samples[: args.max_train_samples]
     if args.max_eval_samples > 0:
         eval_samples = eval_samples[: args.max_eval_samples]
+    if not train_samples:
+        raise RuntimeError("No train samples left after the duration filter.")
 
     device = "cuda" if torch.cuda.is_available() and not args.cpu else "cpu"
     dtype = torch.bfloat16 if device == "cuda" and args.bf16 else torch.float32
     torch.set_float32_matmul_precision("high")
+    total_minutes = sum(_sample_duration(s) for s in train_samples) / 60.0
     print(f"[v3-train] device={device} dtype={dtype}", flush=True)
-    print(f"[v3-train] train={len(train_samples)} eval={len(eval_samples)} task={args.task_type}", flush=True)
+    print(f"[v3-train] train={len(train_samples)} clips ({total_minutes:.1f} min) eval={len(eval_samples)} task={args.task_type}", flush=True)
     print(f"[v3-train] audio_code_cache={code_cache_dir}", flush=True)
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
@@ -264,95 +450,207 @@ def train(args: argparse.Namespace) -> None:
             param.requires_grad_(False)
         for param in model.audio_embedding.parameters():
             param.requires_grad_(False)
+    elif dtype != torch.float32:
+        # Trainable audio modules keep fp32 master weights (bf16 drops tiny updates).
+        model.audio_embedding.float()
+        model.audio_head.weight = model.audio_embedding.weight
     if args.use_lora:
         resume_adapter = resume_dir / "qwen3_lora" if resume_dir else None
         if resume_adapter and resume_adapter.exists():
             model = _load_lora(model, resume_adapter)
         else:
             model = _apply_lora(model, args.lora_rank, args.lora_alpha, args.lora_dropout)
+    if args.gradient_checkpointing:
+        backbone = model.model.get_base_model() if hasattr(model.model, "get_base_model") else model.model
+        backbone.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        print("[v3-train] gradient checkpointing: on", flush=True)
     print(f"[v3-train] {_trainable_parameter_report(model)}", flush=True)
 
-    optimizer = AdamW((p for p in model.parameters() if p.requires_grad), lr=args.learning_rate)
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda _: 1.0)
+    batch_size = max(int(args.batch_size), 1)
+    accum = max(int(args.gradient_accumulation_steps), 1)
+    batches_per_epoch = len(_length_grouped_batches(train_samples, batch_size, args.max_batch_seconds))
+    total_updates = (
+        args.max_steps
+        if args.max_steps > 0
+        else math.ceil(batches_per_epoch * args.num_train_epochs / accum)
+    )
+    optimizer = _build_optimizer(model, args)
+    schedule_free = args.optimizer == "prodigy_sf"
+    if schedule_free:
+        # Schedule-Free replaces the LR schedule; Prodigy's own safeguard handles warmup.
+        args.lr_scheduler, args.warmup_ratio, args.warmup_steps = "constant", 0.0, 0
+    elif args.optimizer == "prodigy":
+        args.warmup_ratio, args.warmup_steps = 0.0, 0  # safeguard_warmup instead of a ramp
+    lr_fn, warmup = _lr_lambda(args, total_updates)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_fn)
+    if schedule_free:
+        optimizer.train()
     optimizer_step = 0
     micro_step = 0
     if resume_dir:
         optimizer_step, micro_step = load_training_state(resume_dir, optimizer, scheduler)
     optimizer.zero_grad(set_to_none=True)
-    batches_per_epoch = math.ceil(len(train_samples) / max(args.batch_size, 1))
-    total_updates = (
-        args.max_steps
-        if args.max_steps > 0
-        else math.ceil(batches_per_epoch * args.num_train_epochs / max(args.gradient_accumulation_steps, 1))
-    )
     total_updates = max(total_updates, optimizer_step)
     writer = None
-    if args.enable_eval_audio or eval_samples:
+    try:
         from torch.utils.tensorboard import SummaryWriter
 
         tb_run_dir = output_dir / "tensorboard" / f"{time.strftime('%Y%m%d_%H%M%S')}_step{optimizer_step:07d}"
         writer = SummaryWriter(log_dir=str(tb_run_dir))
         print(f"[v3-train] TensorBoard run: {tb_run_dir}", flush=True)
+    except Exception as exc:
+        print(f"[v3-train] TensorBoard disabled: {exc}", flush=True)
+    epochs_equiv = total_updates * accum * batch_size / max(len(train_samples), 1)
     print(
-        f"[v3-train] start_optimizer_step={optimizer_step} max_optimizer_steps={total_updates} "
-        f"batch={args.batch_size} grad_accum={args.gradient_accumulation_steps} batches_per_epoch={batches_per_epoch}",
+        f"[v3-train] start_optimizer_step={optimizer_step} max_optimizer_steps={total_updates} (~{epochs_equiv:.1f} epochs) "
+        f"batch={batch_size} grad_accum={accum} effective_batch={batch_size * accum} batches_per_epoch={batches_per_epoch} "
+        f"optimizer={args.optimizer} "
+        + (f"lr={args.learning_rate:.2e} " if args.optimizer == "adamw" else f"lr=auto(d_coef={args.prodigy_d_coef}) ")
+        + f"schedule={args.lr_scheduler} warmup={warmup} min_lr_ratio={args.min_lr_ratio}",
         flush=True,
     )
     pbar = tqdm(total=total_updates, initial=optimizer_step, desc="[v3-train] updates", unit="step")
+    metrics = MetricsLog(output_dir / "metrics.jsonl", fresh=resume_dir is None)
     running_loss = 0.0
     running_batches = 0
-    last_stats = {}
-    last_eval_audio_step = -1
+    loss_ema: float | None = None
+    last_stats: dict = {}
+    nan_steps = 0
+    stop_reason: str | None = None
     train_started_at = time.time()
+    autocast = torch.autocast(device_type="cuda", dtype=torch.bfloat16) if dtype == torch.bfloat16 else _nullcontext()
+    best_dir = output_dir / "checkpoint-best"
 
-    while optimizer_step < total_updates:
-        random.shuffle(train_samples)
-        batch_size = max(args.batch_size, 1)
-        accum_batches = 0
-        for batch_start in range(0, len(train_samples), batch_size):
-            if optimizer_step >= total_updates:
-                break
-            batch = train_samples[batch_start : batch_start + batch_size]
-            is_epoch_tail = batch_start + batch_size >= len(train_samples)
-            batch_loss = None
-            for sample in batch:
-                audio_path, transcript_path = _sample_paths(train_dir, sample)
-                text = normalize_transcript(transcript_path.read_text(encoding="utf-8", errors="ignore"), convert_v2_tags=False)
-                target_codes = _cached_audio_codes(model, audio_path, int(model.config.sample_rate), code_cache_dir)
-                ref_wav, ref_sr, ref_text = _reference_for_sample(train_dir, sample, args.task_type)
-                ref_codes = None
-                if ref_wav is not None:
-                    ref_path = train_dir / sample.get("ref_audio_file", "")
-                    ref_codes = _cached_audio_codes(model, ref_path, int(model.config.sample_rate), code_cache_dir)
-                loss, stats = compute_v3_audio_code_loss(
-                    model,
-                    tokenizer,
-                    text=text,
-                    target_codes=target_codes,
-                    reference_codes=ref_codes,
-                    reference_sample_rate=ref_sr,
-                    reference_text=ref_text,
+    def epoch_at(step: int) -> float:
+        return round(step * accum / max(batches_per_epoch, 1), 3)
+
+    metrics.write(
+        "config",
+        step=optimizer_step,
+        total_steps=total_updates,
+        steps_per_epoch=round(batches_per_epoch / accum, 3),
+        epochs=round(epochs_equiv, 2),
+        optimizer=args.optimizer,
+        lr=args.learning_rate,
+        schedule=args.lr_scheduler,
+        train_clips=len(train_samples),
+        train_minutes=round(total_minutes, 2),
+        eval_clips=len(eval_samples),
+        batch=batch_size,
+        accum=accum,
+        rank=args.lora_rank,
+        patience=args.early_stop_patience,
+        eval_steps=args.eval_steps,
+    )
+
+    # --- eval-audio setup: one fixed unseen sentence + seed for the whole run --
+    eval_text = (args.eval_text or "").strip()
+    if args.enable_eval_audio and not eval_text and eval_samples:
+        ref = min(eval_samples, key=lambda s: abs(_sample_duration(s) - 6.0))
+        ref_audio, ref_txt = _sample_paths(eval_dir, ref)
+        eval_text = normalize_transcript(ref_txt.read_text(encoding="utf-8", errors="ignore"), convert_v2_tags=False)
+        ref_out = output_dir / "eval_audio" / "reference.wav"
+        ref_out.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(ref_audio, ref_out)
+        metrics.write("reference", step=optimizer_step, path=str(ref_out), text=eval_text)
+    if args.enable_eval_audio and not eval_text:
+        eval_text = "This is my voice evolution during training."
+    if args.enable_eval_audio:
+        metrics.write("eval_text", step=optimizer_step, text=eval_text, seed=args.eval_seed)
+
+    preview_ref = {"seconds": None}
+
+    def make_eval_audio(step: int, tag: str = "") -> None:
+        if not args.enable_eval_audio:
+            return
+        try:
+            wav_path = output_dir / "eval_audio" / f"step_{step:07d}{tag}.wav"
+            sr, audio = generate_eval_audio(
+                model, tokenizer, eval_text, wav_path, args.eval_audio_max_new_tokens, seed=args.eval_seed
+            )
+            print(f"[v3-train] optimizer_step={step} eval_audio={wav_path}", flush=True)
+            seconds = round(len(audio) / max(sr, 1), 2)
+            if preview_ref["seconds"] is None and step == 0:
+                preview_ref["seconds"] = seconds
+            runaway = bool(preview_ref["seconds"] and seconds > 2.5 * preview_ref["seconds"])
+            metrics.write("audio", step=step, path=str(wav_path), seconds=seconds, runaway=runaway)
+            if runaway:
+                warn(
+                    step,
+                    f"eval preview ran {seconds:.1f} s for a sentence the base model said in {preview_ref['seconds']:.1f} s: "
+                    "the model failed to stop (unstable end-of-speech). Keep an eye on later previews.",
                 )
-                last_stats = stats
-                batch_loss = loss if batch_loss is None else batch_loss + loss
-            batch_loss = batch_loss / max(len(batch), 1)
-            (batch_loss / max(args.gradient_accumulation_steps, 1)).backward()
-            running_loss += float(batch_loss.detach().cpu())
+            if writer is not None:
+                writer.add_audio("eval/generated_audio", torch.from_numpy(audio).unsqueeze(0), step, sample_rate=sr)
+        except Exception as exc:
+            print(f"[v3-train] eval audio generation failed at optimizer_step {step}: {exc}", flush=True)
+
+    def warn(step: int, message: str) -> None:
+        print(f"[v3-warn] step {step}: {message}", flush=True)
+        metrics.write("warn", step=step, message=message)
+
+    # --- baseline: the model before any update (base + zero LoRA) ---------------
+    guard = OverfitGuard(
+        patience=args.early_stop_patience,
+        min_delta=args.early_stop_min_delta,
+        min_evals=args.early_stop_min_evals,
+        base_eval=metrics.previous_base_eval(),
+        best=_read_best(output_dir),
+        total_steps=total_updates,
+    )
+    if resume_dir is None and eval_samples and args.eval_steps > 0:
+        base_eval = evaluate(model, tokenizer, eval_dir, eval_samples, args)
+        guard.base_eval = base_eval
+        print(f"[v3-train] optimizer_step=0 base_eval_loss={base_eval:.5f}", flush=True)
+        metrics.write("eval", step=0, epoch=0.0, eval_loss=round(base_eval, 6), base=True, status="baseline")
+        if writer is not None:
+            writer.add_scalar("eval/loss", base_eval, 0)
+        make_eval_audio(0, "_base")
+
+    while optimizer_step < total_updates and stop_reason is None:
+        epoch_batches = _length_grouped_batches(train_samples, batch_size, args.max_batch_seconds)
+        accum_batches = 0
+        for b_idx, batch in enumerate(epoch_batches):
+            if optimizer_step >= total_updates or stop_reason is not None:
+                break
+            is_epoch_tail = b_idx == len(epoch_batches) - 1
+            examples = [_make_example(model, train_dir, s, args, code_cache_dir) for s in batch]
+            with autocast:
+                batch_loss, last_stats = compute_v3_batch_loss(model, tokenizer, examples)
+            loss_value_now = float(batch_loss.detach().cpu())
+            if not math.isfinite(loss_value_now):
+                nan_steps += 1
+                optimizer.zero_grad(set_to_none=True)
+                accum_batches = 0
+                warn(optimizer_step, f"non-finite loss ({loss_value_now}); batch skipped ({nan_steps}/3)")
+                if nan_steps >= 3:
+                    stop_reason = "loss became NaN/inf repeatedly (diverged): lower the learning rate"
+                continue
+            (batch_loss / accum).backward()
+            running_loss += loss_value_now
             running_batches += 1
+            loss_ema = loss_value_now if loss_ema is None else 0.9 * loss_ema + 0.1 * loss_value_now
             micro_step += 1
             accum_batches += 1
-            if accum_batches < max(args.gradient_accumulation_steps, 1) and not is_epoch_tail:
+            if accum_batches < accum and not is_epoch_tail:
                 continue
 
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                [p for g in optimizer.param_groups for p in g["params"]],
+                float("inf") if schedule_free else args.max_grad_norm,  # StableAdamW scales updates itself
+            )
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad(set_to_none=True)
             optimizer_step += 1
             accum_batches = 0
             pbar.update(1)
+            grad_norm_value = float(grad_norm)
+            if math.isfinite(grad_norm_value) and guard.note_grad_norm(grad_norm_value):
+                warn(optimizer_step, f"gradient spike: grad_norm {grad_norm_value:.2f} (>5x the recent median)")
             if optimizer_step % max(args.logging_steps, 1) == 0:
                 loss_value = running_loss / max(running_batches, 1)
+                current_lr = _effective_lr(optimizer)
                 print(
                     training_progress_line(
                         "[v3-train]",
@@ -360,91 +658,266 @@ def train(args: argparse.Namespace) -> None:
                         total_updates,
                         loss_value,
                         train_started_at,
-                        suffix=f"stats={last_stats}",
+                        suffix=f"lr={current_lr:.2e} grad_norm={grad_norm_value:.3f} cb0={last_stats.get('cb0')} cb_rest={last_stats.get('cb_rest')}",
                     ),
                     flush=True,
                 )
+                metrics.write(
+                    "train",
+                    step=optimizer_step,
+                    epoch=epoch_at(optimizer_step),
+                    loss=round(loss_value, 5),
+                    lr=current_lr,
+                    grad_norm=round(grad_norm_value, 4),
+                    cb0=last_stats.get("cb0"),
+                    cb_rest=last_stats.get("cb_rest"),
+                )
                 if writer is not None:
                     writer.add_scalar("train/loss", loss_value, optimizer_step)
+                    writer.add_scalar("train/lr", current_lr, optimizer_step)
+                    writer.add_scalar("train/grad_norm", grad_norm_value, optimizer_step)
                 running_loss = 0.0
                 running_batches = 0
-            if eval_samples and args.eval_steps > 0 and optimizer_step % args.eval_steps == 0:
+            eval_due = args.eval_steps > 0 and optimizer_step % args.eval_steps == 0
+            save_due = args.save_steps > 0 and optimizer_step % args.save_steps == 0
+            stop_file = stop_requested()
+            boundary = eval_due or save_due or stop_file or optimizer_step >= total_updates
+            if schedule_free and boundary:
+                optimizer.eval()  # swap in the averaged weights for eval / checkpoints
+            if eval_samples and eval_due:
                 eval_loss = evaluate(model, tokenizer, eval_dir, eval_samples, args)
-                print(f"[v3-train] optimizer_step={optimizer_step} eval_loss={eval_loss:.5f}", flush=True)
+                verdict = guard.update(optimizer_step, eval_loss, loss_ema)
+                print(
+                    f"[v3-train] optimizer_step={optimizer_step} eval_loss={eval_loss:.5f}"
+                    f"{' (best)' if verdict['new_best'] else ''} status={verdict['status']} "
+                    f"patience={verdict['bad_evals']}/{args.early_stop_patience or '-'}",
+                    flush=True,
+                )
+                metrics.write(
+                    "eval",
+                    step=optimizer_step,
+                    epoch=epoch_at(optimizer_step),
+                    eval_loss=round(eval_loss, 6),
+                    train_loss=round(loss_ema, 6) if loss_ema is not None else None,
+                    best=round(guard.best, 6),
+                    best_step=guard.best_step,
+                    bad_evals=verdict["bad_evals"],
+                    status=verdict["status"],
+                )
                 if writer is not None:
                     writer.add_scalar("eval/loss", eval_loss, optimizer_step)
-            if args.enable_eval_audio and args.eval_steps > 0 and optimizer_step % args.eval_steps == 0:
-                try:
-                    wav_path = output_dir / "eval_audio" / f"step_{optimizer_step:07d}.wav"
-                    sr, audio = generate_eval_audio(model, tokenizer, args.eval_text, wav_path, args.eval_audio_max_new_tokens)
-                    last_eval_audio_step = optimizer_step
-                    print(f"[v3-train] optimizer_step={optimizer_step} eval_audio={wav_path}", flush=True)
-                    if writer is not None:
-                        writer.add_audio("eval/generated_audio", torch.from_numpy(audio).unsqueeze(0), optimizer_step, sample_rate=sr)
-                except Exception as exc:
-                    print(f"[v3-train] eval audio generation failed at optimizer_step {optimizer_step}: {exc}", flush=True)
-            if args.save_steps > 0 and optimizer_step % args.save_steps == 0:
+                for message in verdict["warnings"]:
+                    warn(optimizer_step, message)
+                if verdict["new_best"] and args.save_best and args.use_lora:
+                    save_checkpoint(model, tokenizer, best_dir, args.use_lora)
+                    (best_dir / "best_info.json").write_text(
+                        json.dumps({"step": optimizer_step, "eval_loss": round(eval_loss, 6)}), encoding="utf-8"
+                    )
+                if verdict["stop"]:
+                    stop_reason = verdict["stop"]
+            if eval_due:
+                make_eval_audio(optimizer_step)
+            if save_due:
                 checkpoint_dir = output_dir / f"checkpoint-{optimizer_step}"
                 save_checkpoint(model, tokenizer, checkpoint_dir, args.use_lora)
                 save_training_state(checkpoint_dir, optimizer, scheduler, optimizer_step, micro_step, args)
                 save_checkpoint(model, tokenizer, output_dir, args.use_lora)
                 save_training_state(output_dir, optimizer, scheduler, optimizer_step, micro_step, args)
-            if stop_requested():
-                print(f"[v3-train] stop file detected at optimizer_step={optimizer_step}; saving final state.", flush=True)
-                save_checkpoint(model, tokenizer, output_dir, args.use_lora)
-                save_training_state(output_dir, optimizer, scheduler, optimizer_step, micro_step, args)
-                if writer is not None:
-                    writer.flush()
-                    writer.close()
-                pbar.close()
-                print(f"[v3-train] Graceful stop saved to {output_dir}", flush=True)
-                return
+            if stop_file:
+                stop_reason = stop_reason or "stopped by user"
+            if schedule_free and boundary and stop_reason is None:
+                optimizer.train()
 
     pbar.close()
+    if schedule_free:
+        optimizer.eval()
+    finished_normally = stop_reason is None
+    if stop_reason:
+        print(f"[v3-train] Early stop at optimizer_step={optimizer_step}: {stop_reason}", flush=True)
+    # The last weights stay resumable as a regular checkpoint.
+    last_dir = output_dir / f"checkpoint-{optimizer_step}"
+    if optimizer_step > 0 and not (last_dir / "trainer_state.pt").exists():
+        save_checkpoint(model, tokenizer, last_dir, args.use_lora)
+        save_training_state(last_dir, optimizer, scheduler, optimizer_step, micro_step, args)
     save_checkpoint(model, tokenizer, output_dir, args.use_lora)
     save_training_state(output_dir, optimizer, scheduler, optimizer_step, micro_step, args)
-    if args.enable_eval_audio and last_eval_audio_step != optimizer_step:
-        try:
-            wav_path = output_dir / "eval_audio" / f"step_{optimizer_step:07d}_final.wav"
-            sr, audio = generate_eval_audio(model, tokenizer, args.eval_text, wav_path, args.eval_audio_max_new_tokens)
-            print(f"[v3-train] optimizer_step={optimizer_step} final_eval_audio={wav_path}", flush=True)
-            if writer is not None:
-                writer.add_audio("eval/generated_audio_final", torch.from_numpy(audio).unsqueeze(0), optimizer_step, sample_rate=sr)
-        except Exception as exc:
-            print(f"[v3-train] final eval audio generation failed at optimizer_step {optimizer_step}: {exc}", flush=True)
+    final_source = "last"
+    if args.restore_best and args.use_lora and (best_dir / "qwen3_lora").exists() and guard.best_step not in (None, optimizer_step):
+        # Final adapter = best eval (anti-overfitting). Root is no longer a resume point:
+        # continue from checkpoint-<last step> instead.
+        shutil.rmtree(output_dir / "qwen3_lora", ignore_errors=True)
+        shutil.copytree(best_dir / "qwen3_lora", output_dir / "qwen3_lora")
+        (output_dir / "trainer_state.pt").unlink(missing_ok=True)
+        final_source = f"best (step {guard.best_step})"
+        print(f"[v3-train] Final adapter restored from checkpoint-best (step {guard.best_step}, eval {guard.best:.5f}).", flush=True)
+    if finished_normally and guard.last_eval_step != optimizer_step:
+        make_eval_audio(optimizer_step, "_final")
+    metrics.write(
+        "stop",
+        step=optimizer_step,
+        epoch=epoch_at(optimizer_step),
+        reason=stop_reason or "finished",
+        final=final_source,
+        best=round(guard.best, 6) if guard.best is not None else None,
+        best_step=guard.best_step,
+        base_eval=round(guard.base_eval, 6) if guard.base_eval is not None else None,
+    )
     if writer is not None:
         writer.flush()
         writer.close()
+
+
+class MetricsLog:
+    """Append-only JSONL of everything the UI dashboard plots."""
+
+    def __init__(self, path: Path, fresh: bool):
+        self.path = path
+        if fresh:
+            path.unlink(missing_ok=True)
+
+    def write(self, kind: str, **data) -> None:
+        record = {"type": kind, "time": round(time.time(), 2), **data}
+        with self.path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    def previous_base_eval(self) -> float | None:
+        try:
+            for line in self.path.read_text(encoding="utf-8").splitlines():
+                rec = json.loads(line)
+                if rec.get("type") == "eval" and rec.get("base"):
+                    return float(rec["eval_loss"])
+        except Exception:
+            pass
+        return None
+
+
+class OverfitGuard:
+    """Early stopping + overfitting diagnostics from the eval curve.
+
+    * new best: any eval below the best so far (saved to checkpoint-best);
+    * patience counts evals that fail to beat the best by ``min_delta``
+      (relative), so tiny wiggles do not reset it;
+    * stops after ``patience`` such evals (once ``min_evals`` exist), or at
+      once when eval gets worse than the untrained base model after having
+      clearly beaten it (the LoRA is now hurting unseen text);
+    * warns when eval rises twice in a row or the train/eval gap keeps growing.
+    """
+
+    def __init__(
+        self,
+        patience: int,
+        min_delta: float,
+        min_evals: int,
+        base_eval: float | None,
+        best: float | None,
+        total_steps: int = 0,
+    ):
+        self.total_steps = max(int(total_steps), 0)
+        self.patience = max(int(patience), 0)
+        self.min_delta = max(float(min_delta), 0.0)
+        self.min_evals = max(int(min_evals), 1)
+        self.base_eval = base_eval
+        self.best = best
+        self.best_step: int | None = None
+        self.bad_evals = 0
+        self.history: list[tuple[int, float, float | None]] = []
+        self.gap_at_best: float | None = None
+        self.last_eval_step: int | None = None
+        self._grad_norms: list[float] = []
+        self.warming_up = True
+
+    def note_grad_norm(self, value: float) -> bool:
+        recent = self._grad_norms[-50:]
+        self._grad_norms.append(value)
+        if len(recent) < 20:
+            return False
+        median = sorted(recent)[len(recent) // 2]
+        return median > 0 and value > 5 * median
+
+    def update(self, step: int, eval_loss: float, train_loss: float | None) -> dict:
+        warnings: list[str] = []
+        self.history.append((step, eval_loss, train_loss))
+        self.last_eval_step = step
+        gap = eval_loss - train_loss if train_loss is not None else None
+        new_best = self.best is None or eval_loss < self.best
+        meaningful = self.best is None or eval_loss < self.best * (1.0 - self.min_delta)
+        if new_best:
+            self.best, self.best_step = eval_loss, step
+            self.gap_at_best = gap
+        # Warm-up: until the LoRA clearly beats the untrained model (or half the
+        # planned steps are done) a flat eval means "not learning yet", not
+        # "overfitting", so patience is not spent.
+        beat_base = self.base_eval is None or (self.best is not None and self.best < self.base_eval * (1.0 - self.min_delta))
+        past_half = self.total_steps > 0 and step >= self.total_steps * 0.5
+        self.warming_up = not (beat_base or past_half)
+        if meaningful or self.warming_up:
+            self.bad_evals = 0
+        else:
+            self.bad_evals += 1
+
+        rising = len(self.history) >= 3 and self.history[-1][1] > self.history[-2][1] > self.history[-3][1]
+        if self.warming_up:
+            status = "warming up"
+        elif new_best:
+            status = "improving"
+        elif rising and eval_loss > (self.best or eval_loss) * 1.01:
+            status = "overfitting"
+        else:
+            status = "plateau"
+        if rising and not self.warming_up:
+            warnings.append(f"eval loss rose twice in a row ({self.history[-3][1]:.3f} -> {eval_loss:.3f}); best was step {self.best_step}")
+        if gap is not None and self.gap_at_best is not None and not new_best and gap > self.gap_at_best + 0.25:
+            warnings.append(f"train/eval gap widened to {gap:.2f} (was {self.gap_at_best:.2f} at best): the model is memorising the training clips")
+
+        stop = None
+        regressed = (
+            self.base_eval is not None
+            and self.best is not None
+            and self.best < self.base_eval * 0.99
+            and eval_loss > self.base_eval
+        )
+        if regressed:
+            status = "regressed"
+            stop = f"eval {eval_loss:.3f} is now worse than the untrained model ({self.base_eval:.3f}); best was step {self.best_step}"
+        elif self.patience and self.bad_evals >= self.patience and len(self.history) >= self.min_evals:
+            stop = f"no eval improvement for {self.bad_evals} evals (patience {self.patience}); best was step {self.best_step}"
+        return {"new_best": new_best, "status": status, "bad_evals": self.bad_evals, "warnings": warnings, "stop": stop}
+
+
+class _nullcontext:
+    def __enter__(self):
+        return None
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _read_best(output_dir: Path) -> float | None:
+    info = output_dir / "checkpoint-best" / "best_info.json"
+    try:
+        return float(json.loads(info.read_text(encoding="utf-8"))["eval_loss"])
+    except Exception:
+        return None
 
 
 @torch.no_grad()
 def evaluate(model, tokenizer, eval_dir: Path, eval_samples: list[dict], args: argparse.Namespace) -> float:
     was_training = model.training
     model.eval()
-    losses = []
     cache_dir = Path(args.output_dir) / "audio_code_cache"
-    for sample in eval_samples:
-        audio_path, transcript_path = _sample_paths(eval_dir, sample)
-        text = normalize_transcript(transcript_path.read_text(encoding="utf-8", errors="ignore"))
-        target_codes = _cached_audio_codes(model, audio_path, int(model.config.sample_rate), cache_dir)
-        ref_wav, ref_sr, ref_text = _reference_for_sample(eval_dir, sample, args.task_type)
-        ref_codes = None
-        if ref_wav is not None:
-            ref_path = eval_dir / sample.get("ref_audio_file", "")
-            ref_codes = _cached_audio_codes(model, ref_path, int(model.config.sample_rate), cache_dir)
-        loss, _ = compute_v3_audio_code_loss(
-            model,
-            tokenizer,
-            text=text,
-            target_codes=target_codes,
-            reference_codes=ref_codes,
-            reference_sample_rate=ref_sr,
-            reference_text=ref_text,
-        )
-        losses.append(float(loss.detach().cpu()))
+    autocast = torch.autocast(device_type="cuda", dtype=torch.bfloat16) if model.device.type == "cuda" and args.bf16 else _nullcontext()
+    total, tokens = 0.0, 0
+    ordered = sorted(eval_samples, key=_sample_duration)
+    bs = max(int(args.batch_size), 1)
+    for i in range(0, len(ordered), bs):
+        examples = [_make_example(model, eval_dir, s, args, cache_dir) for s in ordered[i : i + bs]]
+        with autocast:
+            loss, stats = compute_v3_batch_loss(model, tokenizer, examples)
+        total += float(loss) * stats["tokens"]
+        tokens += stats["tokens"]
     if was_training:
         model.train()
-    return sum(losses) / max(len(losses), 1)
+    return total / max(tokens, 1)
 
 
 def save_checkpoint(model, tokenizer, output_dir: Path, lora_only: bool) -> None:
@@ -487,7 +960,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save_steps", type=int, default=100)
     parser.add_argument("--eval_steps", type=int, default=50)
     parser.add_argument("--max_train_samples", type=int, default=-1)
-    parser.add_argument("--max_eval_samples", type=int, default=1)
+    parser.add_argument("--max_eval_samples", type=int, default=24)
     parser.add_argument("--use_lora", action="store_true")
     parser.add_argument("--lora_rank", type=int, default=8)
     parser.add_argument("--lora_alpha", type=int, default=16)
@@ -496,9 +969,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cpu", action="store_true")
     parser.add_argument("--freeze_audio_head", action="store_true")
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
+    parser.add_argument("--weight_decay", type=float, default=0.01)
+    parser.add_argument("--lr_scheduler", choices=["cosine", "linear", "constant"], default="cosine")
+    parser.add_argument("--warmup_ratio", type=float, default=0.05)
+    parser.add_argument("--warmup_steps", type=int, default=-1, help="-1 = use --warmup_ratio")
+    parser.add_argument("--min_lr_ratio", type=float, default=0.1)
+    parser.add_argument("--audio_lr_scale", type=float, default=0.1, help="LR multiplier for the tied audio embedding/head")
+    parser.add_argument("--gradient_checkpointing", action="store_true")
+    parser.add_argument("--max_audio_seconds", type=float, default=30.0)
+    parser.add_argument("--max_batch_seconds", type=float, default=40.0, help="Cap on padded audio seconds per micro-batch (0 = off)")
+    parser.add_argument("--min_audio_seconds", type=float, default=0.5)
+    parser.add_argument("--save_best", action="store_true")
+    parser.add_argument("--optimizer", choices=["adamw", "prodigy", "prodigy_sf"], default="adamw")
+    parser.add_argument("--early_stop_patience", type=int, default=3, help="Evals without improvement before stopping (0 = off)")
+    parser.add_argument("--early_stop_min_delta", type=float, default=0.002, help="Relative improvement that resets patience")
+    parser.add_argument("--early_stop_min_evals", type=int, default=3)
+    parser.add_argument("--restore_best", action="store_true", help="Final adapter = best eval checkpoint")
+    parser.add_argument("--eval_seed", type=int, default=1234)
+    parser.add_argument("--prodigy_d_coef", type=float, default=1.0, help="Scales Prodigy's LR estimate (0.5 = half, 2 = double)")
+    parser.add_argument("--prodigy_d0", type=float, default=1e-5, help="Prodigy's starting LR estimate (raise if it stalls)")
     parser.add_argument("--resume_checkpoint", default="")
     parser.add_argument("--enable_eval_audio", action="store_true")
-    parser.add_argument("--eval_text", default="This is my Higgs V3 voice evolution during training.")
+    parser.add_argument("--eval_text", default="", help="Empty = an unseen sentence from the eval set (its recording becomes the reference)")
     parser.add_argument("--eval_audio_max_new_tokens", type=int, default=1000)
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import re
 import gc
 import json
 import os
@@ -29,6 +30,24 @@ WHISPER_LANGS = {
     "Korean": "ko",
     "Russian": "ru",
 }
+
+
+_FILLER_TAG = re.compile(r"\[(um+|uh+|uhm+|hm+|mm+|er+|ah+|eh+|em+|ehm+|mhm)\]", re.IGNORECASE)
+_EVENT_TAG = re.compile(r"\[[^\]]{1,40}\]")
+
+
+def clean_verbatim(text: str) -> str:
+    """CrisperWhisper verbatim -> TTS-friendly text.
+
+    Filler tags like ``[um]`` become the spoken word ("um"), so the transcript
+    still matches the audio; non-speech events (``[laughter]``, ``[noise]``...)
+    are dropped. Repetitions, false starts and spelled-out numbers are kept,
+    which is exactly what a TTS training transcript should contain.
+    """
+    text = _FILLER_TAG.sub(lambda m: m.group(1).lower(), text or "")
+    text = _EVENT_TAG.sub(" ", text)
+    text = re.sub(r"\s+([,.;:!?])", r"\1", text)
+    return re.sub(r"\s{2,}", " ", text).strip()
 
 
 class ASRManager:
@@ -73,20 +92,59 @@ class ASRManager:
         return np.mean(audio, axis=1).astype(np.float32), int(sr)
 
     def _load_whisper(self, label: str):
+        """Load a CrisperWhisper 2.0 model (PyTorch/transformers backend)."""
         if self.whisper_model is not None and self.whisper_label == label:
             return self.whisper_model
+        self.whisper_model = None
         self.higgs_model = None
         self.higgs_tokenizer = None
         self.higgs_transcribe_batch = None
-        from faster_whisper import WhisperModel
+        gc.collect()
         import torch
+        from crisperwhisper import CrisperWhisperModel
 
         model_dir = ensure_asr_model(label)
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        compute_type = "float16" if device == "cuda" else "int8"
-        self.whisper_model = WhisperModel(str(model_dir), device=device, compute_type=compute_type)
+        cuda = torch.cuda.is_available()
+        print(f"[asr] Loading {label} ({'cuda fp16' if cuda else 'cpu fp32'})", flush=True)
+        self.whisper_model = CrisperWhisperModel(
+            str(model_dir),
+            backend="transformers",  # the CT2 fork ships Linux-only wheels
+            device="cuda" if cuda else "cpu",
+            compute_type="float16" if cuda else "float32",
+        )
         self.whisper_label = label
         return self.whisper_model
+
+    def _detect_language(self, model, audio16k: np.ndarray) -> str:
+        """Whisper language id from the first 30 s (CrisperWhisper has no auto mode)."""
+        import torch
+
+        engine = model._engine
+        gen_cfg = engine.model.generation_config
+        lang_to_id = dict(getattr(gen_cfg, "lang_to_id", None) or {})
+        if not lang_to_id:
+            return "en"
+        feats = engine.extract_features(audio16k[: 16000 * 30])
+        sot = getattr(gen_cfg, "decoder_start_token_id", None) or engine.processor.tokenizer.convert_tokens_to_ids("<|startoftranscript|>")
+        with torch.no_grad():
+            logits = engine.model(
+                input_features=feats,
+                decoder_input_ids=torch.tensor([[int(sot)]], device=feats.device),
+            ).logits[0, -1].float()
+        tokens = list(lang_to_id.keys())
+        ids = torch.tensor([lang_to_id[t] for t in tokens], device=logits.device)
+        best = tokens[int(logits[ids].argmax())]
+        return best.strip("<|>")
+
+    def _crisper_transcribe(self, model, audio_path: str, language: str) -> tuple[str, str]:
+        import soxr
+
+        audio, sr = self._read_audio(audio_path)
+        if sr != 16000:
+            audio = soxr.resample(audio, sr, 16000).astype(np.float32)
+        lang_code = WHISPER_LANGS.get(language) or self._detect_language(model, audio)
+        result = model.transcribe(audio, language=lang_code, sr=16000, mode="verbatim")
+        return clean_verbatim(result.text), lang_code
 
     def _load_higgs(self, label: str):
         if self.higgs_model is not None and self.higgs_label == label:
@@ -250,11 +308,8 @@ class ASRManager:
 
         if label in WHISPER_MODELS:
             model = self._load_whisper(label)
-            lang_code = WHISPER_LANGS.get(language)
-            segments, info = model.transcribe(audio_path, beam_size=5, language=lang_code)
-            text = "".join(seg.text for seg in segments).strip()
-            detected = getattr(info, "language", None) or "unknown"
-            return text, f"{label} transcription complete. Detected language: {detected}"
+            text, lang_code = self._crisper_transcribe(model, audio_path, language)
+            return text, f"{label} transcription complete. Language: {lang_code}"
 
         if label in HIGGS_ASR_MODELS:
             self._cleanup_cuda_state()
@@ -275,18 +330,8 @@ class ASRManager:
         if label not in WHISPER_MODELS:
             return self.transcribe(audio_path, label, language)
         model = self._load_whisper(label)
-        lang_code = WHISPER_LANGS.get(language)
-        batch_size = max(int(batch_size or 1), 1)
-        if batch_size > 1:
-            from faster_whisper import BatchedInferencePipeline
-
-            pipeline = BatchedInferencePipeline(model=model)
-            segments, info = pipeline.transcribe(audio_path, beam_size=5, language=lang_code, batch_size=batch_size)
-        else:
-            segments, info = model.transcribe(audio_path, beam_size=5, language=lang_code)
-        text = "".join(seg.text for seg in segments).strip()
-        detected = getattr(info, "language", None) or "unknown"
-        return text, f"{label} transcription complete. Language: {language if lang_code else 'auto'} / detected: {detected}"
+        text, lang_code = self._crisper_transcribe(model, audio_path, language)
+        return text, f"{label} transcription complete. Language: {lang_code}"
 
     def transcribe_many_whisper(
         self,

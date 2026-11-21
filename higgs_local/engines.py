@@ -131,6 +131,15 @@ class HiggsV3Engine:
         self.compile_enabled = False
         self.last_generation_frames = 0
         self.last_generation_audio_sec = 0.0
+        # Fast path (CUDA graphs + merged LoRA); None when using the legacy loop.
+        self.fast = None
+        self.merger = None
+        self.model_dir: Path | None = None
+        self.last_rtf: float | None = None
+
+    @property
+    def fast_active(self) -> bool:
+        return self.fast is not None
 
     def set_runtime(
         self,
@@ -151,7 +160,26 @@ class HiggsV3Engine:
         normalized = adapter_choice or "None"
         if normalized != (self.adapter_choice or "None"):
             self.adapter_choice = normalized
-            self.unload()
+            # The fast path merges/unmerges LoRA in place: no reload needed.
+            if self.fast is None:
+                self.unload()
+
+    def _sync_adapter(self) -> None:
+        """Fast path: make the merged weights match ``adapter_choice``."""
+        if self.merger is None:
+            return
+        adapter_path = resolve_v3_lora_adapter(self.adapter_choice)
+        wanted = str(adapter_path.resolve()) if adapter_path else None
+        if wanted == self.merger.active:
+            return
+        t0 = time.perf_counter()
+        self.merger.apply(adapter_path)
+        self.loaded_adapter_path = str(adapter_path) if adapter_path else None
+        print(
+            f"[v3-adapter] {'Merged LoRA ' + str(adapter_path) if adapter_path else 'Restored base weights'} "
+            f"in {time.perf_counter() - t0:.1f}s (no model reload).",
+            flush=True,
+        )
 
     def load(self):
         if self.model is not None and self.tokenizer is not None:
@@ -206,8 +234,19 @@ class HiggsV3Engine:
             self.model.config.audio_tokenizer_id = str(tokenizer_dir)
         if quant is None and device not in {"cpu"}:
             self.model = self.model.to(device)
-        self._maybe_load_adapter()
+        self.model_dir = Path(model_dir)
         self.model.eval()
+        engine_name = "legacy"
+        if self._fast_eligible(device, precision):
+            try:
+                self._init_fast()
+                engine_name = "fast (CUDA graphs)"
+            except Exception as exc:
+                print(f"[v3-load] Fast engine unavailable, using legacy loop: {exc}", flush=True)
+                self.fast = None
+                self.merger = None
+        if self.fast is None:
+            self._maybe_load_adapter()
         try:
             self.model.get_audio_codec()
         except Exception:
@@ -217,15 +256,36 @@ class HiggsV3Engine:
                 torch.set_float32_matmul_precision("high")
             except Exception:
                 pass
-        self._maybe_compile(torch, device, precision)
+        if self.fast is None:
+            self._maybe_compile(torch, device, precision)
         print(
             "[v3-load] "
-            f"device={device} precision={precision} attention={self.attention_backend} "
+            f"engine={engine_name} device={device} precision={precision} attention={self.attention_backend} "
             f"adapter={self.adapter_choice or 'None'} "
             f"compile={'on' if self.compiled else 'off'} "
             f"time={time.perf_counter() - t0:.2f}s",
             flush=True,
         )
+
+    @staticmethod
+    def _fast_eligible(device: str, precision: str) -> bool:
+        if os.environ.get("HIGGS_FAST_V3", "1").strip().lower() in {"0", "false", "no", "off"}:
+            return False
+        return device == "cuda" and precision == "bf16"
+
+    def _init_fast(self) -> None:
+        from .fast_v3 import FastV3Decoder
+        from .lora_merge import LoraMerger, UnsupportedAdapter
+
+        self.merger = LoraMerger(self.model, self.model_dir)
+        self.fast = FastV3Decoder(self.model)
+        try:
+            self._sync_adapter()
+        except UnsupportedAdapter as exc:
+            # Exotic adapter: fall back to the PEFT wrapper path for this one.
+            self.fast = None
+            self.merger = None
+            raise RuntimeError(f"adapter needs the PEFT wrapper ({exc})") from exc
 
     def _maybe_compile(self, torch, device: str, precision: str):
         self.compiled = False
@@ -295,6 +355,8 @@ class HiggsV3Engine:
             return "cpu"
 
     def unload(self):
+        self.fast = None
+        self.merger = None
         self.model = None
         self.tokenizer = None
         self.loaded_adapter_path = None
@@ -354,6 +416,9 @@ class HiggsV3Engine:
     ):
         import torch
 
+        from .win_scheduling import configure_current_thread
+
+        configure_current_thread()
         try:
             mod = self._modeling_module()
             apply_delay_pattern = mod.apply_delay_pattern
@@ -450,6 +515,167 @@ class HiggsV3Engine:
             self.last_generation_audio_sec = sec
             return audio
 
+    # ------------------------------------------------------------------ fast path
+    @staticmethod
+    def _sampling(temperature, top_p, top_k):
+        return (
+            max(float(temperature), 0.3),
+            float(top_p) if top_p is not None and float(top_p) < 1.0 else None,
+            int(top_k) if top_k is not None and int(top_k) > 0 else None,
+        )
+
+    def _fast_pass(self, text, ref_codes, ref_text, sampling, max_new_tokens, progress_cb, emit_audio, label="audio"):
+        """One AR pass. Yields ("audio", wav) blocks; returns (raw_codes, wav_full)."""
+        import torch
+
+        from .streaming import StreamingCodecDecoder
+
+        mod = self._modeling_module()
+        model = self.model
+        delayed_ref = mod.apply_delay_pattern(ref_codes.to(torch.long)) if ref_codes is not None else None
+        with torch.no_grad():
+            prompt_ids = model._build_prompt_ids(
+                self.tokenizer,
+                text,
+                num_ref_tokens=0 if delayed_ref is None else delayed_ref.shape[0],
+                reference_text=(ref_text or None) if delayed_ref is not None else None,
+            )
+            embeds = model._prefill_embeds(prompt_ids, delayed_ref)
+        temperature, top_p, top_k = sampling
+        stream = StreamingCodecDecoder(model._decode_codes, model.num_codebooks)
+        pieces: list[np.ndarray] = []
+        total = int(max_new_tokens)
+        bar = None
+        try:
+            from tqdm.auto import tqdm
+
+            bar = tqdm(total=total, unit="frame", desc=f"[gen] Higgs V3 {label}", dynamic_ncols=True, leave=True)
+        except Exception:
+            pass
+        frames = 0
+        try:
+            for block in self.fast.generate_rows(
+                embeds,
+                max_new_tokens=total,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                should_stop=lambda: self.cancel_requested,
+            ):
+                frames += int(block.shape[0])
+                if bar is not None:
+                    bar.update(int(block.shape[0]))
+                    bar.set_postfix_str(f"~{frames / 25.0:.1f}s audio")
+                if progress_cb is not None:
+                    try:
+                        progress_cb(frames, total, f"[gen] Higgs V3 {frames}/{total} frames, ~{frames / 25.0:.1f}s audio")
+                    except Exception:
+                        pass
+                for wav in stream.push(block):
+                    pieces.append(wav)
+                    if emit_audio:
+                        yield ("audio", wav)
+        finally:
+            if bar is not None:
+                bar.close()
+                print("", flush=True)
+        if self.cancel_requested:
+            return None, None
+        for wav in stream.flush():
+            pieces.append(wav)
+            if emit_audio:
+                yield ("audio", wav)
+        self.last_generation_frames += frames
+        wav_full = np.concatenate(pieces) if pieces else np.zeros(0, dtype=np.float32)
+        return stream.raw_codes(), wav_full
+
+    def stream(
+        self,
+        text: str,
+        ref_audio: Optional[str] = None,
+        ref_text: str = "",
+        temperature: float = 1.0,
+        top_p: float = 0.95,
+        top_k: int = 50,
+        max_new_tokens: int = 2048,
+        seed: int | None = -1,
+        progress_cb=None,
+        emit_audio: bool = True,
+        segments: list[dict] | None = None,
+        anchor_voice: bool = True,
+    ):
+        """Fast-path generator of events.
+
+        * ``{"type": "audio", "audio": np.float32[...]}`` live blocks (24 kHz mono)
+        * ``{"type": "segment", "index": i, "total": n, "text": ...}`` when a segment starts
+        * ``{"type": "done", "audio": full_wav, "seconds": s, "elapsed": t}``
+
+        ``segments`` (list of ``{"text", "gap"}``) are rendered back to back as one
+        continuous take. Without a reference voice, the first segment's own audio
+        becomes the voice reference for the rest so the speaker stays consistent.
+        """
+        import torch
+
+        self.load()
+        if self.fast is None:
+            raise RuntimeError("Fast engine is not active.")
+        t0 = time.perf_counter()
+        self.cancel_requested = False
+        self.last_generation_frames = 0
+        self._sync_adapter()
+        if seed is not None and int(seed) >= 0:
+            torch.manual_seed(int(seed))
+        sampling = self._sampling(temperature, top_p, top_k)
+        segments = segments or [{"text": text, "gap": 0.0}]
+        ref_codes = None
+        ref_tx = ""
+        if ref_audio:
+            ref_codes, trimmed = self._ref_codes(ref_audio)
+            ref_tx = (ref_text or "").strip() if not trimmed else ""
+        out: list[np.ndarray] = []
+        n = len(segments)
+        for idx, seg in enumerate(segments):
+            seg_text = (seg.get("text") or "").strip()
+            if not seg_text:
+                continue
+            yield {"type": "segment", "index": idx + 1, "total": n, "text": seg_text}
+            gap = float(seg.get("gap", 0.0) or 0.0)
+            if out and gap > 0:
+                silence = np.zeros(int(SAMPLE_RATE * gap), dtype=np.float32)
+                out.append(silence)
+                if emit_audio:
+                    yield {"type": "audio", "audio": silence}
+            label = f"{idx + 1}/{n}" if n > 1 else "audio"
+            gen = self._fast_pass(seg_text, ref_codes, ref_tx, sampling, max_new_tokens, progress_cb, emit_audio, label)
+            raw = wav = None
+            while True:
+                try:
+                    _kind, payload = next(gen)
+                except StopIteration as stop:
+                    raw, wav = stop.value
+                    break
+                yield {"type": "audio", "audio": payload}
+            if self.cancel_requested or wav is None:
+                return
+            out.append(wav)
+            # Anchor the voice on the first segment when no reference was given.
+            if anchor_voice and ref_codes is None and raw is not None and n > 1:
+                max_frames = int(25 * min(20, self.REF_MAX_SEC))
+                if raw.shape[0] >= 25:
+                    ref_codes = raw[:max_frames].clone()
+                    ref_tx = seg_text if raw.shape[0] <= max_frames else ""
+        full = np.concatenate(out) if out else np.zeros(0, dtype=np.float32)
+        elapsed = time.perf_counter() - t0
+        sec = len(full) / SAMPLE_RATE
+        self.last_generation_audio_sec = sec
+        self.last_rtf = elapsed / max(sec, 1e-6)
+        print(
+            f"[gen] Higgs V3 OK: {self.last_generation_frames} frames -> {sec:.1f}s audio in {elapsed:.1f}s "
+            f"({sec / max(elapsed, 1e-6):.2f}x realtime)",
+            flush=True,
+        )
+        yield {"type": "done", "audio": full, "seconds": sec, "elapsed": elapsed}
+
     def generate(
         self,
         text: str,
@@ -488,7 +714,24 @@ class HiggsV3Engine:
             kwargs["reference_codes"] = ref_codes
             if ref_text and not trimmed:
                 kwargs["reference_text"] = ref_text.strip()
-        deterministic = False
+        if self.fast is not None:
+            audio = None
+            for event in self.stream(text, ref_audio=ref_audio, ref_text=ref_text, temperature=temperature,
+                                     top_p=top_p, top_k=top_k, max_new_tokens=max_new_tokens, seed=None,
+                                     progress_cb=progress_cb, emit_audio=False):
+                if event["type"] == "done":
+                    audio = event["audio"]
+            if self.cancel_requested or audio is None:
+                return SAMPLE_RATE, np.zeros(0, dtype=np.float32), "V3 generation cancelled."
+            elapsed = time.perf_counter() - t0
+            sec = len(audio) / SAMPLE_RATE if len(audio) else 0.0
+            return SAMPLE_RATE, audio, (
+                "V3 fast engine generation complete."
+                + f"\n[v3-gen-diagnostics] engine=fast text_chars={len(text)} audio_sec={sec:.2f} "
+                f"elapsed={elapsed:.2f}s rtf={elapsed / max(sec, 1e-6):.2f}"
+                + (f" Adapter: {self.loaded_adapter_path}." if self.loaded_adapter_path else "")
+                + (" Reference was trimmed to 30s." if trimmed else "")
+            )
         audio = self._generate_stream(text, **kwargs)
         if audio is None:
             try:
@@ -969,6 +1212,9 @@ class ModelManager:
             self.active = "v2"
 
     def generate(self, version: str, **kwargs) -> tuple[int, np.ndarray, str]:
+        from .win_scheduling import configure_current_thread
+
+        configure_current_thread()
         self.unload_other(version)
         if version.startswith("Higgs V3"):
             return self.v3.generate(

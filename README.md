@@ -1,6 +1,39 @@
-# 🗣️ Higgs Audio V2/V3 Simple GUI: Local TTS, Voice Cloning & LoRA Training
+# 🗣️ Higgs Audio Easy GUI: Local TTS, Voice Cloning & LoRA Training
 
-A polished Windows WebUI for **local Higgs Audio workflows**: reference voice preparation, Higgs V2/V3 speech generation, Faster-Whisper transcription, dataset building, and LoRA training.
+A polished Windows WebUI for **local Higgs Audio workflows**: reference voice preparation, fast Higgs V3 (and V2) speech generation, CrisperWhisper verbatim transcription, voice isolation + natural segmentation for datasets, and LoRA training with auto-tune, early stopping and a built-in training monitor.
+
+---
+
+## 🆕 What's new — 2026-11-20
+
+### Inference
+- **Fast Higgs V3 engine (bf16):** optimized PyTorch decoder with a static KV cache, CUDA graphs and on-GPU sampling. Same model math as the reference loop, several times faster, and no `torch.compile` warm-up needed. LoRA adapters are merged into the weights, so switching adapters is instant. 8-bit / 4-bit still use the slower compatibility engine.
+- **Seamless long text:** Higgs V3 reads reliably for about 25 s (~300 characters) per pass, so longer text is split automatically at sentence boundaries and rendered back to back as one continuous take with a consistent voice.
+- **Inference progress bar** (segments, frames, elapsed time). Streaming mode was removed.
+- **Waveform player** is always visible and its playhead resets on each new generation.
+- **Windows fixes:** inference no longer slows down when the console window loses focus (background throttling disabled, high-resolution timer, raised process priority). Console QuickEdit is turned off so a stray click can't freeze the app.
+- **VRAM hygiene:** every model (TTS, fast-engine graphs, ASR) is unloaded before dataset building, training and transcription, so nothing lingers in VRAM.
+
+### Interface
+- Wider, responsive layout that uses the screen width (up to 2560 px) with tighter spacing.
+- **LoRA discovery** grouped as *project → checkpoint* (Final, Best eval, and the steps of the current run only).
+
+### ASR & datasets
+- **CrisperWhisper 2.0** (large / turbo / medium / small) replaces faster-whisper: verbatim transcripts with language auto-detection.
+- Dataset preparation now runs **Inworld Voice Isolator** (noise/music removal) and **Inworld SAVA** natural segmentation, plus loudness normalisation.
+
+### Projects
+- **Shared project management** between Dataset Preparation and Training (`projects/<name>/project.json`), with a project card showing the pipeline *Dataset → Training → Voice ready* and an 📂 open-folder button.
+- The project 🔄 button reloads every field from disk, including the V3 recipe and resume checkpoints. When a training run ends, the resume list refreshes automatically.
+- Training with **Resume = None** wipes the previous run of that project (keeping the audio-code cache), so the lists only show the current run.
+
+### Training (Higgs V3)
+- **Rewritten V3 trainer:** padded batches grouped by length with a cap on audio per micro-batch, warmup + cosine/linear/constant schedule, weight decay, optional gradient checkpointing, BOC-masked token loss with per-codebook stats, NaN-batch skipping and gradient-spike warnings.
+- **Optimizers:** AdamW, **Prodigy** and **Prodigy Schedule-Free** (both Prodigy variants estimate the learning rate on their own).
+- **Smart auto-tune:** analyses the dataset (minutes of speech, clip-length distribution, eval set, VRAM) and picks rank, batch × accumulation, LR, epoch budget, eval/save intervals, early-stop patience and gradient checkpointing, with an explanation and data-quality warnings. *It is only a starting point and does not guarantee success: if the voice doesn't sound like the dataset, adjust the values by ear.*
+- **Anti-overfitting guard:** baseline eval of the untrained model, warm-up grace, early stop with patience / minimum improvement, stop when eval falls back below the base model, and warnings when eval rises or the train/eval gap widens. `checkpoint-best` is always saved and by default the **Final adapter = best eval**.
+- **📈 Training monitor** (embedded, no TensorBoard needed): status cards, loss chart (train + eval, base line, best and stop markers), LR and gradient-norm charts, warnings, and an **eval audio evolution** panel — the same sentence and seed at every eval step, next to the real recording and the base model, with "best" and "did not stop" badges.
+- **Training progress bar** in the same style as inference; the old text status was removed.
 
 ---
 
@@ -8,16 +41,17 @@ A polished Windows WebUI for **local Higgs Audio workflows**: reference voice pr
 
 | Area | What it does |
 | :--- | :--- |
-| **Higgs V3 TTS** | Local Transformers inference with modern Higgs V3 speech generation. |
+| **Higgs V3 TTS** | Fast local inference (static KV cache + CUDA graphs) with seamless long-text rendering. |
 | **Higgs V2 TTS** | Local Higgs V2 generation for legacy/experimental workflows. |
 | **Reference Voice Library** | Save reusable voice samples and transcripts under `samples/`. |
-| **LoRA Adapters** | Load V2/V3 adapters from `exp/` and switch them from the GUI. |
+| **LoRA Adapters** | Pick *project → checkpoint* (Final / Best eval / steps) from `exp/`; instant switching on the fast engine. |
 | **Single Inference** | Generate speech from target text with optional reference audio and seed control. |
 | **Dialogue Builder** | Build multi-speaker turns, assign voice references, and concatenate the final WAV. |
 | **Long-Form / Batch** | Split long text by paragraph, period, line, or speaker turns, then join chunks. |
-| **Faster-Whisper ASR** | Transcribe reference samples or dataset audio locally. |
-| **Dataset Preparation** | Convert curated audio folders into train/eval datasets under `data/`. |
-| **Training UI** | Run single-speaker LoRA training for V2 and experimental V3 training. |
+| **CrisperWhisper 2.0 ASR** | Verbatim transcription (numbers spelled out, repetitions kept) for references and datasets. |
+| **Dataset Preparation** | Voice isolation + SAVA segmentation + ASR into train/eval datasets under `data/`. |
+| **Training UI** | V3 LoRA training with auto-tune, Prodigy optimizers, early stopping and a built-in monitor (V2 also supported). |
+| **Projects** | One project shared by Dataset and Training, with saved settings and a pipeline card. |
 | **Local Storage Layout** | Models, cache, datasets, LoRAs, logs, samples, and outputs are organized by folder. |
 
 ---
@@ -40,7 +74,7 @@ The included V3 trainer uses teacher-forced cross entropy over delayed 8-codeboo
 
 The GUI follows a complete local voice workflow:
 
-### 1. 🎙️ Prep Samples
+### 1. 🎙️ Voice Library
 
 <img src="./assets/asr.png">
 
@@ -48,7 +82,7 @@ Build a reusable reference voice library.
 
 - Import or record short reference clips.
 - Trim samples to a clean, stable range.
-- Transcribe with Faster-Whisper or write transcripts manually.
+- Transcribe with CrisperWhisper 2.0 or write transcripts manually.
 - Save paired audio/transcript samples to `samples/`.
 
 Recommended reference clips are usually **5–30 seconds**, clean, single-speaker, and free of background music or overlapping voices.
@@ -67,7 +101,7 @@ Generate speech with Higgs V2 or V3.
 - Tune the desired parameters under advanced settings.
 - Save generated WAV files under `outputs/`.
 
-Long text should use chunking. Every chunk is a separate synthesis pass, so slight voice/prosody variation can happen between chunks.
+Long text is segmented automatically (~300 characters per pass) and joined seamlessly; a progress bar shows segments and frames while it renders.
 
 ---
 
@@ -90,11 +124,13 @@ This is useful for podcasts, demos, character testing, and comparing voice refer
 
 <img src="./assets/dataset.png">
 
-Prepare train/eval datasets from local audio folders.
+Prepare train/eval datasets from local audio folders. Pick or create a **project**: its settings are saved and shared with the Training tab.
 
 - Supports common audio formats.
 - Uses existing `.txt` or `.json` transcripts when available.
-- Fills missing transcripts with Faster-Whisper.
+- Isolates the voice with [Inworld Voice Isolator](https://github.com/inworld-ai/voice-isolator) (noise and music removal).
+- Cuts natural 2–15 s speech segments with [Inworld SAVA](https://github.com/inworld-ai/sava) and normalises loudness.
+- Fills missing transcripts with CrisperWhisper 2.0 (verbatim).
 - Writes prepared train/eval data under `data/`.
 - Validates dataset structure before training.
 
@@ -106,11 +142,21 @@ Prepare train/eval datasets from local audio folders.
 
 Train or resume LoRA projects.
 
-- Select a training project.
-- Choose V2 or experimental V3.
-- Configure batch size, gradient accumulation, learning rate, LoRA rank, bf16, logging, save, and eval intervals.
-- Resume from discovered checkpoints.
-- Store outputs, adapters, checkpoints, and eval audio under `exp/`.
+- Select the project (🔄 reloads all its fields and checkpoints).
+- Click **🧠 Analyze & Auto-tune** to get a plan for your dataset and VRAM.
+- Optionally pick an optimizer (AdamW / Prodigy / Prodigy Schedule-Free) and anti-overfitting settings under **🧪 V3 recipe (advanced)**.
+- Leave the Eval Zone text empty to use a sentence from the eval set (its real recording is shown for comparison).
+- Start training and follow it in the progress bar and the **📈 Training monitor**; early stopping ends the run when eval stops improving.
+- Resume from the current run's checkpoints, or use **Final** (= best eval) in Inference.
+- Outputs, adapters, checkpoints, `metrics.jsonl` and eval audio are stored under `exp/<project>/`.
+
+**Tips when the result isn't right** (auto-tune is a starting point, not a guarantee):
+
+| Symptom | Try |
+| :--- | :--- |
+| Voice not close enough / generic | More epochs, higher rank, slightly higher LR (or Prodigy d_coef 1.5–2), more patience. |
+| Artifacts, mumbling, skipped words, doesn't stop talking | Overfitted: earlier checkpoint, fewer epochs, lower LR (or d_coef 0.5), lower rank. |
+| Previews vary a lot | Larger effective batch (more gradient accumulation). |
 
 ---
 
@@ -180,7 +226,7 @@ http://127.0.0.1:7860
 
 | Task | Minimum | Recommended |
 | :--- | :---: | :---: |
-| **Faster-Whisper ASR** | CPU or small GPU | 8 GB+ VRAM for large-v3 |
+| **CrisperWhisper 2.0 ASR** | CPU or small GPU | ~5 GB VRAM for large, ~2.5 GB for turbo |
 | **Higgs V2 inference** | 12 GB VRAM | 16 GB+ VRAM |
 | **Higgs V3 inference** | 16 GB VRAM | 24 GB+ VRAM |
 | **LoRA training** | 24 GB VRAM | 24 GB+ VRAM |
@@ -198,7 +244,8 @@ CPU mode is available for compatibility, but TTS inference and training are expe
 | `samples/` | Reference voice samples and transcripts. |
 | `outputs/` | Persisted generated WAV files. |
 | `data/` | Prepared training datasets. |
-| `exp/` | Training projects, LoRA adapters, checkpoints, and eval audio. |
+| `projects/` | Project settings shared by Dataset and Training (`project.json`). |
+| `exp/` | Training runs: LoRA adapters, checkpoints, `checkpoint-best`, metrics and eval audio. |
 | `logs/` | App and training logs. |
 | `config/` | Local UI settings. |
 
@@ -236,8 +283,9 @@ my_voice.txt
 
 ### Higgs V3 Generation
 
-- V3 can stop a generation around its internal end signal even when `max_new_tokens` is high.
-- Use chunking for long text.
+- The fast engine (bf16) is used by default; 8-bit / 4-bit fall back to the compatibility engine.
+- Each pass covers ~25 s of speech; longer text is segmented automatically.
+- Sampling is distributionally identical to the reference engine, but a given seed produces a different take than with the old engine.
 - Lower temperature and top-p values usually improve stability.
 - Fixed seeds help compare settings; random seeds can improve natural variation.
 
@@ -256,7 +304,7 @@ If generation loops, try lowering the repeat count. If speech becomes too clippe
 
 ### Torch Compile
 
-Torch compile is optional and can increase the synthesis speed by up to 2.3x (Nvidia GPU only)
+Only relevant for the **compatibility engine** (8-bit / 4-bit); the fast engine doesn't need it. There it can increase synthesis speed by up to 2.3x (NVIDIA GPU only).
 
 - First generation can be slower (take up to 5 minutes) because kernels need warmup.
 - Similar later generations can be significantly faster.
@@ -267,7 +315,7 @@ Torch compile is optional and can increase the synthesis speed by up to 2.3x (Nv
 
 ## 📊 RTX 3090 Compile Benchmark
 
-GUI Higgs V3 test on **NVIDIA GeForce RTX 3090**, same text, seed, and frame limit.
+Compatibility-engine Higgs V3 test on **NVIDIA GeForce RTX 3090**, same text, seed, and frame limit (measured before the fast engine existed).
 
 ```text
 Max audio frames: 4096
@@ -292,10 +340,11 @@ In this run, `torch.compile` was about **2.3× faster** during frame generation 
 | :--- | :--- |
 | CUDA OOM during inference | Lower max frames, unload ASR, disable compile, use chunking, or try lower precision if supported. |
 | Voice changes between chunks | Enable shared chunk seed, use shorter chunks, or reuse the same reference sample consistently. |
-| Output stops early | Use chunking; V3 may stop at its internal end signal. |
+| Output skips words on long text | Keep automatic segmentation on; one pass reads reliably only ~25 s. |
+| Inference slow with the console in background | Fixed on 2026-11-20; restart the app if it was started before updating. |
 | First compile run seems frozen | Wait for kernel compilation; later runs with similar shapes should be faster. |
-| ASR is slow | Use a smaller Faster-Whisper model or CPU-friendly settings. |
-| Training overfits quickly | Lower learning rate, reduce max steps, increase eval frequency, and use cleaner/more varied data. |
+| ASR is slow | Use CrisperWhisper 2.0 turbo or small. |
+| Training overfits quickly | Keep an eval set so early stopping works, use Final = best eval, lower LR / epochs, and use cleaner, more varied data. |
 
 ---
 
@@ -306,7 +355,10 @@ Built for local use around:
 - [Boson AI Higgs Audio](https://github.com/boson-ai/higgs-audio)
 - [Train Higgs Audio repo](https://github.com/JimmyMa99/train-higgs-audio)
 - [tuanh123789/Higgs-tts-3-finetune](https://github.com/tuanh123789/Higgs-tts-3-finetune)
-- [Faster-Whisper / CTranslate2](https://github.com/SYSTRAN/faster-whisper)
+- [CrisperWhisper](https://github.com/nyrahealth/CrisperWhisper) (weights: non-commercial research license)
+- [Prodigy](https://github.com/konstmish/prodigy) and [Prodigy Plus Schedule-Free](https://github.com/LoganBooker/prodigy-plus-schedule-free) optimizers
+- [speech-studio](https://github.com/timoncool/speech-studio) (inspiration for the fast engine) and [Mixomo/Qwen_TTS_Easy_GUI](https://github.com/Mixomo/Qwen_TTS_Easy_GUI) (project management)
+- [Inworld SAVA](https://github.com/inworld-ai/sava) and [Voice Isolator](https://github.com/inworld-ai/voice-isolator) (Apache-2.0)
 
 
 GUI layout and workflow inspired by [FranckyB](https://github.com/FranckyB) [Voice Clone Studio](https://github.com/FranckyB/Voice-Clone-Studio)

@@ -24,6 +24,7 @@ class TrainingProcessManager:
         self.run_name = ""
         self.stop_file: Path | None = None
         self._tail: deque[str] = deque(maxlen=240)
+        self._evals: list[tuple[int, float]] = []  # every (step, eval_loss) of the current run
         self._lock = threading.Lock()
         self._reader_thread: threading.Thread | None = None
 
@@ -68,6 +69,69 @@ class TrainingProcessManager:
             return f"{minutes}m {secs:02d}s"
         return f"{secs}s"
 
+    def progress_info(self) -> dict:
+        """Structured progress parsed from the trainer output (for the UI bar).
+
+        Uses tqdm's per-step ``N/T [elapsed<remaining`` updates for position and
+        ETA, the periodic ``[v3-train] ... loss= lr=`` lines for loss / LR and
+        every ``eval_loss=`` line to report the best evaluation so far.
+        """
+        info: dict = {"state": "idle", "run": self.run_name}
+        if self.process is None:
+            return info
+        with self._lock:
+            lines = list(self._tail)
+        code = self.process.poll()
+        info["elapsed"] = int(time.time() - self.started_at) if self.started_at else 0
+        info["state"] = "running" if code is None else ("done" if code == 0 else "error")
+        info["code"] = code
+        # Evals come from the full-run history (the tail is flooded by tqdm lines).
+        with self._lock:
+            evals = list(self._evals)
+        if evals:
+            best_step, best_loss = min(evals, key=lambda item: item[1])
+            info["best_eval"], info["best_step"] = best_loss, best_step
+            info["last_eval_step"], info["last_eval"] = evals[-1]
+            # Overfitting: the last two evals both got worse after the best one.
+            if len(evals) >= 3 and evals[-1][1] > evals[-2][1] > best_loss and best_step < evals[-2][0]:
+                info["overfitting_since"] = best_step
+        for line in lines:
+            if "stop file detected" in line or "Stop requested" in line:
+                info["stopped"] = True
+            if "Traceback" in line or "Error:" in line or "OutOfMemoryError" in line:
+                info["error_line"] = line.strip()[-160:]
+        def seconds(clock: str) -> int:
+            parts = [int(p) for p in clock.split(":")]
+            return sum(v * 60**i for i, v in enumerate(reversed(parts)))
+
+        loader_bars = ("Loading weights", "Loading checkpoint", "Fetching", "Downloading", "Map", "Generating", "audio_code")
+        for line in reversed(lines):
+            if "step" not in info:
+                matches = [] if any(tag in line for tag in loader_bars) else re.findall(
+                    r"(\d+)/(\d+) \[(\d+(?::\d+){1,2})<(\d+(?::\d+){1,2}|\?)", line
+                )
+                if matches:
+                    step, total, elapsed_clock, remaining = matches[-1]
+                    info["step"], info["total"] = int(step), int(total)
+                    # tqdm's own clock excludes model loading, so s/step is honest.
+                    info["train_elapsed"] = seconds(elapsed_clock)
+                    if remaining != "?":
+                        info["eta"] = seconds(remaining)
+                else:
+                    match = re.search(r"optimizer_step=(\d+)/(\d+)", line)
+                    if match:
+                        info["step"], info["total"] = int(match.group(1)), int(match.group(2))
+            if "loss" not in info:
+                match = re.search(r"optimizer_step=\d+/\d+ loss=([\d.]+)", line)
+                if match:
+                    info["loss"] = float(match.group(1))
+                    lr = re.search(r"\blr=([\d.eE+-]+)", line)
+                    if lr:
+                        info["lr"] = float(lr.group(1))
+            if "step" in info and "loss" in info:
+                break
+        return info
+
     def is_running(self) -> bool:
         return self.process is not None and self.process.poll() is None
 
@@ -88,6 +152,7 @@ class TrainingProcessManager:
         self.started_at = time.time()
         with self._lock:
             self._tail.clear()
+            self._evals.clear()
 
         env = os.environ.copy()
         env.setdefault("PYTHONUNBUFFERED", "1")
@@ -124,8 +189,11 @@ class TrainingProcessManager:
 
     def _append_line(self, line: str) -> None:
         clean = line.rstrip("\n")
+        match = re.search(r"optimizer_step=(\d+) eval_loss=([\d.]+)", clean)
         with self._lock:
             self._tail.append(clean)
+            if match:
+                self._evals.append((int(match.group(1)), float(match.group(2))))
         print(clean, flush=True)
         if self.log_path:
             with self.log_path.open("a", encoding="utf-8", errors="replace") as handle:
@@ -172,21 +240,9 @@ class TrainingProcessManager:
         return self.status_markdown(), self.tail_text()
 
     def status_markdown(self) -> str:
-        if self.process is None:
-            return "### Training Status\nIdle."
-        code = self.process.poll()
-        elapsed = int(time.time() - self.started_at) if self.started_at else 0
-        log_line = f"\n\nLog: `{self.log_path}`" if self.log_path else ""
-        eta_line = self._eta_line(elapsed)
-        if code is None:
-            return (
-                f"### Training Status\nRunning `{self.run_name}` for {self._format_duration(elapsed)}. "
-                f"PID `{self.process.pid}`.{eta_line}{log_line}"
-            )
-        return (
-            f"### Training Status\nFinished `{self.run_name}` with exit code `{code}` "
-            f"after {self._format_duration(elapsed)}.{eta_line}{log_line}"
-        )
+        # Running / finished / ETA / steps are all shown by the progress bar and
+        # the project card now; this text box only carries one-off warnings.
+        return ""
 
     def tail_text(self) -> str:
         with self._lock:
@@ -213,12 +269,12 @@ class TrainingProcessManager:
 
     def launch_tensorboard(self, run_name: str | None = None) -> tuple[str, str]:
         if self.tensorboard_process is not None and self.tensorboard_process.poll() is None:
-            return "### TensorBoard\nAlready running at http://127.0.0.1:6006", self.tail_text()
+            return "📊 TensorBoard already running at http://127.0.0.1:6006", self.tail_text()
         try:
             import pkg_resources  # noqa: F401
         except ModuleNotFoundError:
             message = (
-                "### TensorBoard\nMissing runtime dependency `setuptools`.\n\n"
+                "⚠️ TensorBoard: missing runtime dependency `setuptools`. "
                 "TensorBoard imports `pkg_resources`, which is provided by setuptools. "
                 "Run `uv pip install setuptools` or rerun `install.bat`."
             )
@@ -285,4 +341,4 @@ class TrainingProcessManager:
             webbrowser.open(url)
 
         threading.Thread(target=_open_browser, daemon=True).start()
-        return f"### TensorBoard\nStarted at {url}\n\nLogdir: `{logdir}`", self.tail_text()
+        return f"📊 TensorBoard started at {url}", self.tail_text()

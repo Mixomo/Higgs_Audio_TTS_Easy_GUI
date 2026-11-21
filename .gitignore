@@ -11,6 +11,7 @@ voices/
 data/
 exp/
 models/
+projects/
 config/*.json
 torch_backend.txt
 
@@ -68,3 +69,8 @@ train-higgs-audio/pyproject.toml
 Thumbs.db
 .vscode/
 .idea/
+
+# Private demos
+demo_resources
+demo_gui.py
+start-demo.bat
