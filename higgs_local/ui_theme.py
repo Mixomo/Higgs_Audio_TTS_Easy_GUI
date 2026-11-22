@@ -152,6 +152,24 @@ CSS = """
   font-family: var(--font) !important;
 }
 
+/* ---------- @ tag autocomplete ---------- */
+#tag-ac-pop {
+  display: none; position: fixed; z-index: 10000; width: 340px; max-width: calc(100vw - 16px); max-height: 320px;
+  overflow-y: auto; padding: 4px; border-radius: 10px; border: 1px solid var(--border-color-primary);
+  background: var(--background-fill-primary); box-shadow: 0 14px 36px rgba(0,0,0,.35); font-size: .86rem;
+}
+#tag-ac-pop .tag-ac-cat {
+  padding: 6px 8px 2px; font-size: .7rem; font-weight: 700; letter-spacing: .08em; text-transform: uppercase;
+  color: var(--body-text-color-subdued);
+}
+#tag-ac-pop .tag-ac-item {
+  display: flex; justify-content: space-between; gap: 10px; padding: 5px 8px; border-radius: 6px; cursor: pointer;
+}
+#tag-ac-pop .tag-ac-item.active, #tag-ac-pop .tag-ac-item:hover { background: rgba(139,92,246,.22); }
+#tag-ac-pop .tag-ac-label { font-family: var(--font-mono, monospace); font-variant-ligatures: none; font-feature-settings: "liga" 0, "calt" 0; color: var(--body-text-color); white-space: nowrap; }
+#tag-ac-pop .tag-ac-hint { color: var(--body-text-color-subdued); font-size: .74rem; white-space: nowrap; }
+#tag-ac-pop .tag-ac-empty { padding: 8px; color: var(--body-text-color-subdued); }
+
 /* ---------- buttons ---------- */
 .button-primary { font-weight: 700 !important; letter-spacing: .01em; box-shadow: 0 8px 22px rgba(124,58,237,.28); }
 .button-primary:disabled { box-shadow: none; opacity: .7; }
@@ -277,6 +295,10 @@ CSS = """
 }
 .audio-safe-space *, .audio-safe-space *::before, .audio-safe-space *::after { scrollbar-width: none !important; -ms-overflow-style: none !important; }
 .audio-safe-space ::-webkit-scrollbar { width: 0 !important; height: 0 !important; display: none !important; }
+/* Long audio: wavesurfer adds a horizontal scrollbar inside its shadow DOM, which made the
+   fixed-height #waveform box overflow onto the time labels. Let the box grow and keep the bar thin. */
+div#waveform { height: auto !important; }
+*::part(scroll) { scrollbar-width: thin; scrollbar-color: rgba(139,92,246,.55) transparent; }
 .output-clean, .output-clean > div, .output-clean .wrap, .output-clean [data-testid="block-info"] { border: 0 !important; box-shadow: none !important; }
 .console-accordion, .console-accordion > div { border-radius: 16px !important; }
 #higgs-console-body::-webkit-scrollbar { width: 5px; }

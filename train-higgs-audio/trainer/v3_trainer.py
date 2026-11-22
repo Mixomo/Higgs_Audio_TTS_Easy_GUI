@@ -58,11 +58,14 @@ def format_duration(seconds: float) -> str:
     return f"{secs}s"
 
 
-def training_progress_line(prefix: str, step: int, total: int, loss: float, started_at: float, suffix: str = "") -> str:
+def training_progress_line(
+    prefix: str, step: int, total: int, loss: float, started_at: float, suffix: str = "", start_step: int = 0
+) -> str:
     total = max(int(total), 1)
     step = max(int(step), 0)
     elapsed = max(time.time() - started_at, 1e-6)
-    speed = step / elapsed if step else 0.0
+    done = max(step - int(start_step), 0)  # steps of this session (a resumed run starts mid-way)
+    speed = done / elapsed if done else 0.0
     remaining = (total - step) / speed if speed > 0 else 0.0
     pct = 100.0 * min(step, total) / total
     width = 28
@@ -166,7 +169,17 @@ def _trainable_parameter_report(model) -> str:
     return f"trainable params: {trainable:,} / {total:,} ({pct:.4f}%)"
 
 
-def save_training_state(out_dir: Path, optimizer, scheduler, optimizer_step: int, micro_step: int, args: argparse.Namespace) -> None:
+def save_training_state(
+    out_dir: Path,
+    optimizer,
+    scheduler,
+    optimizer_step: int,
+    micro_step: int,
+    args: argparse.Namespace,
+    extra: dict | None = None,
+) -> None:
+    """Everything needed to continue exactly: optimizer (incl. Prodigy's d), LR schedule position,
+    RNG, early-stop guard, running loss average and the planned length of the run."""
     state = {
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict() if scheduler is not None else None,
@@ -178,16 +191,29 @@ def save_training_state(out_dir: Path, optimizer, scheduler, optimizer_step: int
         "cuda_rng_state_all": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
         "python_rng_state": random.getstate(),
         "args": vars(args),
+        "lr_multiplier": _lr_multiplier(scheduler),
+        **(extra or {}),
     }
     torch.save(state, out_dir / "trainer_state.pt")
 
 
-def load_training_state(checkpoint_dir: Path, optimizer, scheduler=None) -> tuple[int, int]:
+def _lr_multiplier(scheduler) -> float | None:
+    """Current LR as a fraction of the base LR (where the schedule is right now)."""
+    try:
+        base = float(scheduler.base_lrs[0])
+        return float(scheduler.get_last_lr()[0]) / base if base > 0 else None
+    except Exception:
+        return None
+
+
+def load_training_state(checkpoint_dir: Path, optimizer, scheduler=None) -> tuple[int, int, dict]:
+    """Restore optimizer / scheduler / RNG. Returns (optimizer_step, micro_step, full saved state)."""
     state_path = checkpoint_dir / "trainer_state.pt"
     if not state_path.exists():
         print(f"[v3-train] No trainer_state.pt found in {checkpoint_dir}; adapter/model weights only.", flush=True)
-        return 0, 0
+        return 0, 0, {}
     state = torch.load(state_path, map_location="cpu", weights_only=False)
+    state["_optimizer_restored"] = False
     saved_name = state.get("optimizer_name", "adamw")
     current_name = type(optimizer).__name__.lower()
     expected = {"adamw": "adamw", "prodigy": "prodigy", "prodigy_sf": "prodigyplusschedulefree"}.get(saved_name, saved_name)
@@ -199,6 +225,7 @@ def load_training_state(checkpoint_dir: Path, optimizer, scheduler=None) -> tupl
         )
     else:
         optimizer.load_state_dict(state["optimizer"])
+        state["_optimizer_restored"] = True
         if scheduler is not None and state.get("scheduler") is not None:
             scheduler.load_state_dict(state["scheduler"])
     if state.get("torch_rng_state") is not None:
@@ -213,7 +240,60 @@ def load_training_state(checkpoint_dir: Path, optimizer, scheduler=None) -> tupl
         f"[v3-train] Restored optimizer/scheduler/RNG optimizer_step={optimizer_step} micro_step={micro_step} from {state_path}",
         flush=True,
     )
-    return optimizer_step, micro_step
+    return optimizer_step, micro_step, state
+
+
+def _continue_schedule(args: argparse.Namespace, optimizer, scheduler, state: dict, start_step: int, total_updates: int,
+                       base_lrs: list[float], warmup: int, lr_fn) -> str:
+    """Keep the learning rate continuous across a resume.
+
+    Same run length and schedule: the original curve simply goes on. Otherwise (more epochs / steps,
+    another schedule or LR): the LR continues from where it was and the remaining schedule is fitted
+    to the remaining steps - cosine / linear keep decaying from the current value to the floor,
+    constant stays there. No new warmup. Returns a short description for the log."""
+    saved_args = state.get("args") or {}
+    multiplier = state.get("lr_multiplier")
+    if multiplier is None:
+        try:
+            multiplier = float(state["scheduler"]["_last_lr"][0]) / float(state["scheduler"]["base_lrs"][0])
+        except Exception:
+            multiplier = lr_fn(start_step)
+    multiplier = float(multiplier)
+    lr_changed = abs(float(saved_args.get("learning_rate", args.learning_rate)) - float(args.learning_rate)) > 1e-12
+    same_plan = (
+        int(state.get("total_updates") or -1) == int(total_updates)
+        and saved_args.get("lr_scheduler") == args.lr_scheduler
+        and not lr_changed
+    )
+    if same_plan and state.get("scheduler") is not None:
+        fn = lr_fn
+        how = "same plan: the original schedule continues"
+    else:
+        floor = min(max(args.min_lr_ratio, 0.0), 1.0)
+        remaining = max(total_updates - start_step, 1)
+        end = min(floor, multiplier)
+        schedule = args.lr_scheduler
+
+        def fn(step: int, m0=multiplier, end=end, s0=start_step, n=remaining, schedule=schedule) -> float:
+            if schedule == "constant":
+                return m0
+            progress = min(max((step - s0) / float(n), 0.0), 1.0)
+            if schedule == "linear":
+                return end + (m0 - end) * (1.0 - progress)
+            return end + (m0 - end) * 0.5 * (1.0 + math.cos(math.pi * progress))
+
+        how = f"continues from {multiplier:.3f}x base LR, {schedule} over the {remaining} remaining steps (no new warmup)"
+        if schedule != "constant" and multiplier <= floor * 1.05:
+            how += "; the previous schedule had already decayed to its floor"
+    # Base LR: the one chosen now (lets you change it on resume); the multiplier keeps continuity.
+    scheduler.base_lrs = list(base_lrs)
+    scheduler.lr_lambdas = [fn] * len(optimizer.param_groups)
+    scheduler.last_epoch = start_step
+    for group, base in zip(optimizer.param_groups, base_lrs):
+        group["initial_lr"] = base
+        group["lr"] = base * fn(start_step)
+    scheduler._last_lr = [g["lr"] for g in optimizer.param_groups]
+    return how
 
 
 def generate_eval_audio(
@@ -416,6 +496,7 @@ def train(args: argparse.Namespace) -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     code_cache_dir = output_dir / "audio_code_cache"
+    (output_dir / "live_settings.json").unlink(missing_ok=True)  # live changes belong to one run only
     resume_dir = Path(args.resume_checkpoint) if args.resume_checkpoint else None
 
     if args.task_type not in SUPPORTED_TASKS:
@@ -475,6 +556,7 @@ def train(args: argparse.Namespace) -> None:
         else math.ceil(batches_per_epoch * args.num_train_epochs / accum)
     )
     optimizer = _build_optimizer(model, args)
+    base_lrs = [float(g["lr"]) for g in optimizer.param_groups]
     schedule_free = args.optimizer == "prodigy_sf"
     if schedule_free:
         # Schedule-Free replaces the LR schedule; Prodigy's own safeguard handles warmup.
@@ -487,10 +569,27 @@ def train(args: argparse.Namespace) -> None:
         optimizer.train()
     optimizer_step = 0
     micro_step = 0
+    resume_state: dict = {}
     if resume_dir:
-        optimizer_step, micro_step = load_training_state(resume_dir, optimizer, scheduler)
+        optimizer_step, micro_step, resume_state = load_training_state(resume_dir, optimizer, scheduler)
     optimizer.zero_grad(set_to_none=True)
+    if resume_state and optimizer_step >= total_updates:
+        print(
+            f"[v3-train] The checkpoint is already at step {optimizer_step} of the planned {total_updates}: "
+            "raise Epochs (or Max steps) to train further.",
+            flush=True,
+        )
     total_updates = max(total_updates, optimizer_step)
+    start_step = optimizer_step
+    if resume_state:
+        if schedule_free and resume_state.get("_optimizer_restored"):
+            # Checkpoints are written with the averaged (eval) weights: swap back to training weights.
+            optimizer.train()
+        if not schedule_free:
+            how = _continue_schedule(args, optimizer, scheduler, resume_state, optimizer_step, total_updates, base_lrs, warmup, lr_fn)
+            print(f"[v3-train] LR on resume: {_effective_lr(optimizer):.3e} ({how})", flush=True)
+        else:
+            print(f"[v3-train] LR on resume: Schedule-Free keeps its own state (d={_effective_lr(optimizer):.3e})", flush=True)
     writer = None
     try:
         from torch.utils.tensorboard import SummaryWriter
@@ -511,9 +610,19 @@ def train(args: argparse.Namespace) -> None:
     )
     pbar = tqdm(total=total_updates, initial=optimizer_step, desc="[v3-train] updates", unit="step")
     metrics = MetricsLog(output_dir / "metrics.jsonl", fresh=resume_dir is None)
+    if resume_dir is not None:
+        # Drop what a later, abandoned branch logged after this checkpoint, so the charts read as one run.
+        previous = metrics.truncate_after(optimizer_step)
+        metrics.write(
+            "resume",
+            step=optimizer_step,
+            checkpoint=resume_dir.name if resume_dir != output_dir else "last state",
+            previous_reason=previous,
+            lr=_effective_lr(optimizer),
+        )
     running_loss = 0.0
     running_batches = 0
-    loss_ema: float | None = None
+    loss_ema: float | None = resume_state.get("loss_ema") if resume_state else None
     last_stats: dict = {}
     nan_steps = 0
     stop_reason: str | None = None
@@ -545,6 +654,9 @@ def train(args: argparse.Namespace) -> None:
 
     # --- eval-audio setup: one fixed unseen sentence + seed for the whole run --
     eval_text = (args.eval_text or "").strip()
+    previous_text = metrics.last_eval_text() if resume_dir is not None else None
+    if args.enable_eval_audio and not eval_text and previous_text:
+        eval_text = previous_text  # same preview sentence as before the resume: previews stay comparable
     if args.enable_eval_audio and not eval_text and eval_samples:
         ref = min(eval_samples, key=lambda s: abs(_sample_duration(s) - 6.0))
         ref_audio, ref_txt = _sample_paths(eval_dir, ref)
@@ -555,10 +667,10 @@ def train(args: argparse.Namespace) -> None:
         metrics.write("reference", step=optimizer_step, path=str(ref_out), text=eval_text)
     if args.enable_eval_audio and not eval_text:
         eval_text = "This is my voice evolution during training."
-    if args.enable_eval_audio:
+    if args.enable_eval_audio and eval_text != previous_text:
         metrics.write("eval_text", step=optimizer_step, text=eval_text, seed=args.eval_seed)
 
-    preview_ref = {"seconds": None}
+    preview_ref = {"seconds": metrics.base_audio_seconds() if resume_dir is not None else None}
 
     def make_eval_audio(step: int, tag: str = "") -> None:
         if not args.enable_eval_audio:
@@ -585,19 +697,64 @@ def train(args: argparse.Namespace) -> None:
         except Exception as exc:
             print(f"[v3-train] eval audio generation failed at optimizer_step {step}: {exc}", flush=True)
 
+    def extra_state(reason: str | None = None) -> dict:
+        return {
+            "guard": guard.state_dict(),
+            "loss_ema": loss_ema,
+            "total_updates": total_updates,
+            "stop_reason": reason,
+        }
+
     def warn(step: int, message: str) -> None:
         print(f"[v3-warn] step {step}: {message}", flush=True)
         metrics.write("warn", step=step, message=message)
 
     # --- baseline: the model before any update (base + zero LoRA) ---------------
+    best_loss, best_step = _read_best(output_dir)
     guard = OverfitGuard(
         patience=args.early_stop_patience,
         min_delta=args.early_stop_min_delta,
         min_evals=args.early_stop_min_evals,
         base_eval=metrics.previous_base_eval(),
-        best=_read_best(output_dir),
+        best=best_loss,
         total_steps=total_updates,
     )
+    guard.best_step = best_step
+    if resume_state.get("guard"):
+        guard.load_state(resume_state["guard"], resume_step=optimizer_step)
+        if guard.best is None and best_loss is not None:
+            guard.best, guard.best_step = best_loss, best_step
+        if str(resume_state.get("stop_reason") or "").startswith("no eval improvement"):
+            print(
+                f"[v3-train] The previous run stopped on patience ({guard.bad_evals}/{resume_state.get('args', {}).get('early_stop_patience')}); "
+                f"the counter restarts at 0/{guard.patience} because you chose to continue.",
+                flush=True,
+            )
+            guard.bad_evals = 0
+    elif resume_state:
+        guard.load_history(metrics.eval_history(optimizer_step))
+    if resume_state and best_step is not None and best_step > optimizer_step:
+        # checkpoint-best came from a later branch that is being discarded: point it back at this branch's best.
+        source = output_dir / f"checkpoint-{guard.best_step}" if guard.best_step else None
+        shutil.rmtree(best_dir, ignore_errors=True)
+        if source is not None and (source / "qwen3_lora").exists():
+            shutil.copytree(source, best_dir, ignore=shutil.ignore_patterns("trainer_state.pt"))
+            (best_dir / "best_info.json").write_text(
+                json.dumps({"step": guard.best_step, "eval_loss": round(guard.best, 6)}), encoding="utf-8"
+            )
+            print(f"[v3-train] checkpoint-best reset to step {guard.best_step} (the later branch is discarded).", flush=True)
+        else:
+            print("[v3-train] checkpoint-best belonged to a discarded branch and was removed.", flush=True)
+    if resume_state:
+        for step_, loss_ in [(st, ls) for st, ls, _tr in guard.history]:
+            # Seed the UI progress bar with this run's eval history.
+            print(f"[v3-train] optimizer_step={step_} eval_loss={loss_:.5f} (history)", flush=True)
+        print(
+            f"[v3-train] Resumed guard: best={guard.best if guard.best is None else round(guard.best, 5)} "
+            f"@ step {guard.best_step}, patience {guard.bad_evals}/{guard.patience or '-'}, "
+            f"{len(guard.history)} previous evals",
+            flush=True,
+        )
     if resume_dir is None and eval_samples and args.eval_steps > 0:
         base_eval = evaluate(model, tokenizer, eval_dir, eval_samples, args)
         guard.base_eval = base_eval
@@ -659,6 +816,7 @@ def train(args: argparse.Namespace) -> None:
                         loss_value,
                         train_started_at,
                         suffix=f"lr={current_lr:.2e} grad_norm={grad_norm_value:.3f} cb0={last_stats.get('cb0')} cb_rest={last_stats.get('cb_rest')}",
+                        start_step=start_step,
                     ),
                     flush=True,
                 )
@@ -685,12 +843,18 @@ def train(args: argparse.Namespace) -> None:
             if schedule_free and boundary:
                 optimizer.eval()  # swap in the averaged weights for eval / checkpoints
             if eval_samples and eval_due:
+                live = _live_settings(output_dir)
+                if "early_stop_patience" in live and int(live["early_stop_patience"]) != guard.patience:
+                    guard.patience = max(int(live["early_stop_patience"]), 0)
+                    args.early_stop_patience = guard.patience
+                    print(f"[v3-train] patience changed live to {guard.patience or 'off'}", flush=True)
+                    metrics.write("patience", step=optimizer_step, patience=guard.patience)
                 eval_loss = evaluate(model, tokenizer, eval_dir, eval_samples, args)
                 verdict = guard.update(optimizer_step, eval_loss, loss_ema)
                 print(
                     f"[v3-train] optimizer_step={optimizer_step} eval_loss={eval_loss:.5f}"
                     f"{' (best)' if verdict['new_best'] else ''} status={verdict['status']} "
-                    f"patience={verdict['bad_evals']}/{args.early_stop_patience or '-'}",
+                    f"patience={verdict['bad_evals']}/{guard.patience or '-'}",
                     flush=True,
                 )
                 metrics.write(
@@ -702,6 +866,7 @@ def train(args: argparse.Namespace) -> None:
                     best=round(guard.best, 6),
                     best_step=guard.best_step,
                     bad_evals=verdict["bad_evals"],
+                    patience=guard.patience,
                     status=verdict["status"],
                 )
                 if writer is not None:
@@ -720,9 +885,9 @@ def train(args: argparse.Namespace) -> None:
             if save_due:
                 checkpoint_dir = output_dir / f"checkpoint-{optimizer_step}"
                 save_checkpoint(model, tokenizer, checkpoint_dir, args.use_lora)
-                save_training_state(checkpoint_dir, optimizer, scheduler, optimizer_step, micro_step, args)
+                save_training_state(checkpoint_dir, optimizer, scheduler, optimizer_step, micro_step, args, extra_state(stop_reason))
                 save_checkpoint(model, tokenizer, output_dir, args.use_lora)
-                save_training_state(output_dir, optimizer, scheduler, optimizer_step, micro_step, args)
+                save_training_state(output_dir, optimizer, scheduler, optimizer_step, micro_step, args, extra_state(stop_reason))
             if stop_file:
                 stop_reason = stop_reason or "stopped by user"
             if schedule_free and boundary and stop_reason is None:
@@ -738,9 +903,12 @@ def train(args: argparse.Namespace) -> None:
     last_dir = output_dir / f"checkpoint-{optimizer_step}"
     if optimizer_step > 0 and not (last_dir / "trainer_state.pt").exists():
         save_checkpoint(model, tokenizer, last_dir, args.use_lora)
-        save_training_state(last_dir, optimizer, scheduler, optimizer_step, micro_step, args)
+        save_training_state(last_dir, optimizer, scheduler, optimizer_step, micro_step, args, extra_state(stop_reason))
+    elif optimizer_step > 0:
+        # Already saved at this step before the stop decision: refresh it with the final guard state.
+        save_training_state(last_dir, optimizer, scheduler, optimizer_step, micro_step, args, extra_state(stop_reason))
     save_checkpoint(model, tokenizer, output_dir, args.use_lora)
-    save_training_state(output_dir, optimizer, scheduler, optimizer_step, micro_step, args)
+    save_training_state(output_dir, optimizer, scheduler, optimizer_step, micro_step, args, extra_state(stop_reason))
     final_source = "last"
     if args.restore_best and args.use_lora and (best_dir / "qwen3_lora").exists() and guard.best_step not in (None, optimizer_step):
         # Final adapter = best eval (anti-overfitting). Root is no longer a resume point:
@@ -779,6 +947,51 @@ class MetricsLog:
         record = {"type": kind, "time": round(time.time(), 2), **data}
         with self.path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    def _records(self) -> list[dict]:
+        records = []
+        try:
+            for line in self.path.read_text(encoding="utf-8").splitlines():
+                try:
+                    records.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+        except OSError:
+            pass
+        return records
+
+    def truncate_after(self, step: int) -> str | None:
+        """Remove records of steps after ``step`` and the stop record of the run being continued.
+        Returns how that run ended (for the 'resume' marker)."""
+        records = self._records()
+        previous = None
+        kept = []
+        for rec in records:
+            if rec.get("type") == "stop" and int(rec.get("step", 0)) >= step:
+                previous = rec.get("reason")
+                if int(rec.get("step", 0)) == step:
+                    continue
+            if int(rec.get("step", 0)) > step:
+                continue
+            kept.append(rec)
+        if previous is None:
+            previous = next((r.get("reason") for r in reversed(kept) if r.get("type") == "stop"), None)
+        if len(kept) != len(records):
+            self.path.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in kept), encoding="utf-8")
+        return previous
+
+    def last_eval_text(self) -> str | None:
+        return next((r.get("text") for r in reversed(self._records()) if r.get("type") == "eval_text"), None)
+
+    def base_audio_seconds(self) -> float | None:
+        return next((r.get("seconds") for r in self._records() if r.get("type") == "audio" and r.get("step") == 0), None)
+
+    def eval_history(self, up_to: int) -> list[tuple[int, float, float | None]]:
+        return [
+            (int(r["step"]), float(r["eval_loss"]), r.get("train_loss"))
+            for r in self._records()
+            if r.get("type") == "eval" and not r.get("base") and int(r.get("step", 0)) <= up_to
+        ]
 
     def previous_base_eval(self) -> float | None:
         try:
@@ -825,6 +1038,36 @@ class OverfitGuard:
         self.last_eval_step: int | None = None
         self._grad_norms: list[float] = []
         self.warming_up = True
+
+    def state_dict(self) -> dict:
+        return {
+            "best": self.best,
+            "best_step": self.best_step,
+            "bad_evals": self.bad_evals,
+            "history": [list(h) for h in self.history],
+            "gap_at_best": self.gap_at_best,
+            "last_eval_step": self.last_eval_step,
+            "grad_norms": self._grad_norms[-50:],
+            "warming_up": self.warming_up,
+            "base_eval": self.base_eval,
+        }
+
+    def load_state(self, state: dict, resume_step: int) -> None:
+        self.best = state.get("best", self.best)
+        self.best_step = state.get("best_step", self.best_step)
+        self.bad_evals = int(state.get("bad_evals", 0))
+        self.history = [tuple(h) for h in state.get("history", []) if int(h[0]) <= resume_step]
+        self.gap_at_best = state.get("gap_at_best")
+        self.last_eval_step = state.get("last_eval_step")
+        self._grad_norms = list(state.get("grad_norms") or [])
+        self.warming_up = bool(state.get("warming_up", True))
+        if self.base_eval is None:
+            self.base_eval = state.get("base_eval")
+
+    def load_history(self, history: list[tuple[int, float, float | None]]) -> None:
+        """Older checkpoints without guard state: rebuild it from metrics.jsonl."""
+        for step, eval_loss, train_loss in history:
+            self.update(step, eval_loss, train_loss)
 
     def note_grad_norm(self, value: float) -> bool:
         recent = self._grad_norms[-50:]
@@ -892,12 +1135,21 @@ class _nullcontext:
         return False
 
 
-def _read_best(output_dir: Path) -> float | None:
+def _live_settings(output_dir: Path) -> dict:
+    """Settings the UI may change while training runs (exp/<run>/live_settings.json)."""
+    try:
+        return dict(json.loads((output_dir / "live_settings.json").read_text(encoding="utf-8")))
+    except Exception:
+        return {}
+
+
+def _read_best(output_dir: Path) -> tuple[float | None, int | None]:
     info = output_dir / "checkpoint-best" / "best_info.json"
     try:
-        return float(json.loads(info.read_text(encoding="utf-8"))["eval_loss"])
+        data = json.loads(info.read_text(encoding="utf-8"))
+        return float(data["eval_loss"]), int(data["step"]) if data.get("step") is not None else None
     except Exception:
-        return None
+        return None, None
 
 
 @torch.no_grad()

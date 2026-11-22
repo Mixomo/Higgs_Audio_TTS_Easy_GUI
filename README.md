@@ -4,7 +4,31 @@ A polished Windows WebUI for **local Higgs Audio workflows**: reference voice pr
 
 ---
 
-## 🆕 What's new — 2026-11-20
+## 🆕 What's new — 2026-11-22
+
+### Inference
+- **@ tag autocomplete:** type `@` anywhere in the script (also dialogue lines and the checkpoint-compare text) to open the tags the selected model supports — V3 emotions, styles, prosody and sound effects (`<|sfx:laughter|>Haha` comes with its sound word), or V2 events like `[laugh]` / `[music start]`. Keep typing to filter (`@sad`, `@sfx:cough`), ↑/↓ to move, Enter/Tab to insert, Esc to close.
+- **Steady delivery across segments:** when the text is split, sentence-level V3 tags (emotion, style, environment, speed / pitch / expressiveness) carry over to the following segments, so the intonation doesn't drift back to neutral after a split. Tags written later add up and only replace the previous tag of the same kind; sound effects and pauses are never repeated, and Speaker turns keep only their own tags. On by default; turn it off with **Carry tags across segments** (next to the long-text mode). The Dialogue builder follows the same switch: tags carry between the chunks of one line, and each line keeps its own tags.
+- **Player fixes:** long audio no longer hides the time labels under the waveform's scrollbar (now a thin bar below the waveform), and the finished-generation summary shows the audio length in minutes (e.g. `15:47 min`).
+- **Reference clips from any dataset:** Inference and Voice Library have a 📥 importer that lists every Higgs dataset split (`data/<project>/train|eval`) or any folder with audio + `.txt` pairs (`metadata.jsonl` also works), searchable by name, length and text. A file picker loads a single audio file from anywhere together with its `.txt` (found automatically, or picked alongside it).
+
+### 🧰 Utils tab (new)
+- **Disk usage** of every downloaded model and cache, LoRA run and dataset (size per item and total), with delete-after-confirmation. Items in use by a running training can't be deleted.
+- **Checkpoint management** per LoRA run, plus **⭐ Keep only best** (removes the numbered checkpoints; `checkpoint-best` and the final adapter stay).
+- **🎧 Quick checkpoint compare:** pick a LoRA run, select any or all of its checkpoints, type a custom sentence and generate it on each one with the same voice, seed and temperature; the results play side by side and are saved in `exp/<run>/checkpoint_compare/`.
+
+### Datasets
+- **YouTube as dataset input** (yt-dlp): paste videos, playlists or channels (one per line, optional `1:20-5:00` section). The audio is downloaded to `downloads/<project>` and then cleaned, segmented and transcribed like any raw recording. ffmpeg (imageio-ffmpeg) and the JavaScript runtime YouTube needs (deno) are bundled, so nothing has to be installed on the system. Only use content you have the rights to train on.
+- **Import ready datasets:** point to a folder or `.zip` of audio + `.txt` pairs (e.g. `R:\dataset`). An optional `metadata.jsonl` is used when present (text, `keep` flag and train/eval split); `metadata.csv` (LJSpeech style) also works, and `LICENSE*` / `.md` notes are copied along. Optional clean-up per clip: separation engine, SAVA voice-activity edge trim (never cuts inside the text), dropping clips with too little speech, and loudness normalisation.
+- **Text-to-audio alignment** (Qwen3-ForcedAligner 0.6B): optional final step for both raw recordings and ready datasets. Every word of each transcript is placed in time; clips are trimmed to the first / last spoken word, and clips whose text does not match the audio (wrong, partial or shifted transcripts) can be dropped automatically. 11 languages (es, en, fr, de, it, pt, ru, ja, ko, zh, yue); the model downloads once into `models/qwen3-forced-aligner-0.6b`.
+
+### Training
+- **Seamless training resume:** a resumed run keeps its full state — optimizer (incl. Prodigy's d and Schedule-Free weights), LR position without a new warmup, best eval, patience counter, loss average and preview sentence. Raising Epochs continues the decay from the current LR instead of restarting the cosine. Resuming from an earlier checkpoint discards the later branch (metrics and `checkpoint-best`), so charts and status read as one run with a "resumed" marker.
+- **Editable patience:** early-stop patience sits next to the resume selector and can be changed on resume or live while training (applied at the next eval).
+
+---
+
+## What's new — 2026-11-20
 
 ### Inference
 - **Fast Higgs V3 engine (bf16):** optimized PyTorch decoder with a static KV cache, CUDA graphs and on-GPU sampling. Same model math as the reference loop, several times faster, and no `torch.compile` warm-up needed. LoRA adapters are merged into the weights, so switching adapters is instant. 8-bit / 4-bit still use the slower compatibility engine.
@@ -21,6 +45,7 @@ A polished Windows WebUI for **local Higgs Audio workflows**: reference voice pr
 ### ASR & datasets
 - **CrisperWhisper 2.0** (large / turbo / medium / small) replaces faster-whisper: verbatim transcripts with language auto-detection.
 - Dataset preparation now runs **Inworld Voice Isolator** (noise/music removal) and **Inworld SAVA** natural segmentation, plus loudness normalisation.
+- **Voice clean-up engines**: Inworld Voice Isolator or Mel-Band / BS-RoFormer models (voc_fv7, gabox denoise, becruily deux, becruily karaoke), alone or chained. RoFormer checkpoints download once into `models/mss`.
 
 ### Projects
 - **Shared project management** between Dataset Preparation and Training (`projects/<name>/project.json`), with a project card showing the pipeline *Dataset → Training → Voice ready* and an 📂 open-folder button.
@@ -103,6 +128,10 @@ Generate speech with Higgs V2 or V3.
 
 Long text is segmented automatically (~300 characters per pass) and joined seamlessly; a progress bar shows segments and frames while it renders.
 
+Sentence-level tags (emotion, style, speed / pitch / expressiveness) carry over to the following segments so the delivery doesn't drift back to neutral after a split; tags written later add up, replacing only the previous tag of the same kind (a new emotion replaces the old emotion, the rest stays) (Speaker turns keep only their own tags).
+
+Type `@` anywhere in the script to pick a tag supported by the selected model (emotion, style, prosody, sound effect for V3; events for V2).
+
 ---
 
 ### 3. 👥 Dialogue / Multi-Speaker
@@ -128,9 +157,11 @@ Prepare train/eval datasets from local audio folders. Pick or create a **project
 
 - Supports common audio formats.
 - Uses existing `.txt` or `.json` transcripts when available.
-- Isolates the voice with [Inworld Voice Isolator](https://github.com/inworld-ai/voice-isolator) (noise and music removal).
-- Cuts natural 2–15 s speech segments with [Inworld SAVA](https://github.com/inworld-ai/sava) and normalises loudness.
+- **Three sources:** 🎙️ raw recordings, ▶️ YouTube links via [yt-dlp](https://github.com/yt-dlp/yt-dlp) (both segmented and transcribed) or 📦 a ready dataset (folder or `.zip` of audio + `.txt`, optional `metadata.jsonl`).
+- Cleans the voice with [Inworld Voice Isolator](https://github.com/inworld-ai/voice-isolator) or Mel-Band / BS-RoFormer separation (music, noise, background voices), alone or chained.
+- Cuts natural 2–15 s speech segments with [Inworld SAVA](https://github.com/inworld-ai/sava) and normalises loudness (ready datasets: optional SAVA edge trim and low-speech filter).
 - Fills missing transcripts with CrisperWhisper 2.0 (verbatim).
+- Optionally aligns every transcript to its audio with [Qwen3-ForcedAligner](https://huggingface.co/Qwen/Qwen3-ForcedAligner-0.6B-hf): tight clip edges and automatic removal of clips whose text does not match.
 - Writes prepared train/eval data under `data/`.
 - Validates dataset structure before training.
 
@@ -149,6 +180,7 @@ Train or resume LoRA projects.
 - Start training and follow it in the progress bar and the **📈 Training monitor**; early stopping ends the run when eval stops improving.
 - Resume from the current run's checkpoints, or use **Final** (= best eval) in Inference.
 - Outputs, adapters, checkpoints, `metrics.jsonl` and eval audio are stored under `exp/<project>/`.
+- To pick the best checkpoint by ear, use **🧰 Utils → 🎧 Quick checkpoint compare**; to free disk space, **⭐ Keep only best** in the same tab.
 
 **Tips when the result isn't right** (auto-tune is a starting point, not a guarantee):
 
@@ -359,6 +391,8 @@ Built for local use around:
 - [Prodigy](https://github.com/konstmish/prodigy) and [Prodigy Plus Schedule-Free](https://github.com/LoganBooker/prodigy-plus-schedule-free) optimizers
 - [speech-studio](https://github.com/timoncool/speech-studio) (inspiration for the fast engine) and [Mixomo/Qwen_TTS_Easy_GUI](https://github.com/Mixomo/Qwen_TTS_Easy_GUI) (project management)
 - [Inworld SAVA](https://github.com/inworld-ai/sava) and [Voice Isolator](https://github.com/inworld-ai/voice-isolator) (Apache-2.0)
+- [Qwen3-ForcedAligner](https://huggingface.co/Qwen/Qwen3-ForcedAligner-0.6B-hf) (Apache-2.0) and [pymss](https://pypi.org/project/pymss/) with the Mel-Band / BS-RoFormer models of becruily and GaboxR67
+- [yt-dlp](https://github.com/yt-dlp/yt-dlp) (Unlicense), [deno](https://deno.com) and [imageio-ffmpeg](https://github.com/imageio/imageio-ffmpeg) for YouTube downloads
 
 
 GUI layout and workflow inspired by [FranckyB](https://github.com/FranckyB) [Voice Clone Studio](https://github.com/FranckyB/Voice-Clone-Studio)

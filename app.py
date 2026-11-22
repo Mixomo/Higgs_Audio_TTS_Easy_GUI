@@ -132,6 +132,7 @@ from higgs_local.adapters import (
     normalize_adapter_choice,
 )
 from higgs_local.asr import ASRManager, WHISPER_LANGS
+from higgs_local.dataset_audio import CLEAN_ENGINES
 from higgs_local.engines import ModelManager, text_chunks_for_ui
 from higgs_local.model_registry import (
     DEFAULT_ASR_MODEL,
@@ -202,6 +203,116 @@ APP_JS = """
   });
   setInterval(tick, 500);
   tick();
+
+  // ---------------- @ tag autocomplete (Inference script, dialogue lines, eval / compare texts)
+  const CATALOG = __TAG_CATALOG__;
+  const modelFor = (ta) => {
+    if (ta.closest('.tag-ac-v3')) return 'Higgs V3 TTS';
+    const sel = document.querySelector('#infer-model-select input');
+    return sel && /V2/.test(sel.value || '') ? 'Higgs V2 TTS' : 'Higgs V3 TTS';
+  };
+  const pop = document.createElement('div');
+  pop.id = 'tag-ac-pop';
+  pop.setAttribute('role', 'listbox');
+  document.body.appendChild(pop);
+  let st = null;  // {ta, start, items, idx}
+
+  const caretXY = (ta, pos) => {
+    const cs = getComputedStyle(ta);
+    const m = document.createElement('div');
+    for (const p of ['boxSizing','width','paddingTop','paddingRight','paddingBottom','paddingLeft',
+                     'borderTopWidth','borderRightWidth','borderBottomWidth','borderLeftWidth',
+                     'fontFamily','fontSize','fontWeight','fontStyle','letterSpacing','lineHeight',
+                     'textTransform','wordSpacing','tabSize']) m.style[p] = cs[p];
+    m.style.position = 'absolute'; m.style.visibility = 'hidden'; m.style.top = '0'; m.style.left = '-9999px';
+    m.style.whiteSpace = 'pre-wrap'; m.style.wordWrap = 'break-word'; m.style.overflow = 'hidden';
+    m.textContent = ta.value.slice(0, pos);
+    const mark = document.createElement('span');
+    mark.textContent = ta.value.slice(pos) || '.';
+    m.appendChild(mark);
+    document.body.appendChild(m);
+    const r = ta.getBoundingClientRect();
+    const lh = parseFloat(cs.lineHeight) || parseFloat(cs.fontSize) * 1.3;
+    const xy = { x: r.left + mark.offsetLeft - ta.scrollLeft, y: r.top + mark.offsetTop - ta.scrollTop + lh };
+    m.remove();
+    return xy;
+  };
+  const close = () => { st = null; pop.style.display = 'none'; };
+  const render = () => {
+    pop.innerHTML = '';
+    if (!st.items.length) {
+      const e = document.createElement('div'); e.className = 'tag-ac-empty';
+      e.textContent = 'No tag matches · Esc to close'; pop.appendChild(e); return;
+    }
+    let lastCat = null;
+    st.items.forEach((it, i) => {
+      if (it.cat !== lastCat) {
+        const h = document.createElement('div'); h.className = 'tag-ac-cat'; h.textContent = it.cat; pop.appendChild(h);
+        lastCat = it.cat;
+      }
+      const row = document.createElement('div');
+      row.className = 'tag-ac-item' + (i === st.idx ? ' active' : '');
+      row.setAttribute('role', 'option');
+      const a = document.createElement('span'); a.className = 'tag-ac-label'; a.textContent = it.label;
+      const b = document.createElement('span'); b.className = 'tag-ac-hint'; b.textContent = it.hint;
+      row.append(a, b);
+      row.addEventListener('mousedown', (ev) => { ev.preventDefault(); st.idx = i; choose(); });
+      pop.appendChild(row);
+    });
+    const act = pop.querySelector('.tag-ac-item.active');
+    if (act) act.scrollIntoView({ block: 'nearest' });
+  };
+  const update = (ta) => {
+    const pos = ta.selectionStart, before = ta.value.slice(0, pos);
+    const at = before.lastIndexOf('@');
+    if (at < 0 || ta.selectionEnd !== pos) return close();
+    const q = before.slice(at + 1);
+    if (/\\s/.test(q) || q.length > 40) return close();
+    const list = CATALOG[modelFor(ta)] || [];
+    const words = q.toLowerCase().split(/[:|_<>\\[\\]-]+/).filter(Boolean);
+    const items = list.filter((it) => {
+      const hay = (it.cat + ' ' + it.label).toLowerCase();
+      return words.every((w) => hay.includes(w));
+    });
+    const keep = st && st.ta === ta && st.start === at ? Math.min(st.idx, Math.max(items.length - 1, 0)) : 0;
+    st = { ta, start: at, items, idx: keep };
+    render();
+    const xy = caretXY(ta, at);
+    pop.style.display = 'block';
+    const w = pop.offsetWidth, h = pop.offsetHeight;
+    let x = Math.min(xy.x, window.innerWidth - w - 8), y = xy.y + 4;
+    if (y + h > window.innerHeight - 8) y = Math.max(8, xy.y - h - 28);
+    pop.style.left = Math.max(8, x) + 'px'; pop.style.top = y + 'px';
+  };
+  const choose = () => {
+    if (!st || !st.items.length) return close();
+    const { ta, start } = st, it = st.items[st.idx];
+    const end = ta.selectionStart;
+    const v = ta.value;
+    const next = v.slice(end);
+    const ins = it.insert + (it.hint === 'inline' && next && !/^\\s/.test(next) ? ' ' : '');
+    ta.value = v.slice(0, start) + ins + next;
+    const caret = start + ins.length;
+    ta.setSelectionRange(caret, caret);
+    ta.dispatchEvent(new Event('input', { bubbles: true }));
+    close();
+    ta.focus();
+  };
+  const isTarget = (el) => el && el.tagName === 'TEXTAREA' && el.closest('.tag-ac, .tag-ac-v3');
+  document.addEventListener('input', (e) => { if (isTarget(e.target)) update(e.target); }, true);
+  document.addEventListener('keydown', (e) => {
+    if (!st || e.target !== st.ta) return;
+    const n = st.items.length;
+    if (e.key === 'ArrowDown' && n) { st.idx = (st.idx + 1) % n; render(); e.preventDefault(); }
+    else if (e.key === 'ArrowUp' && n) { st.idx = (st.idx - 1 + n) % n; render(); e.preventDefault(); }
+    else if ((e.key === 'Enter' || e.key === 'Tab') && n) { e.preventDefault(); e.stopPropagation(); choose(); }
+    else if (e.key === 'Escape') { e.preventDefault(); close(); }
+  }, true);
+  document.addEventListener('click', (e) => { if (st && e.target !== st.ta && !pop.contains(e.target)) close(); }, true);
+  document.addEventListener('keyup', (e) => {
+    if (st && e.target === st.ta && (e.key === 'ArrowLeft' || e.key === 'ArrowRight' || e.key === 'Home' || e.key === 'End')) update(e.target);
+  }, true);
+  window.addEventListener('scroll', (e) => { if (st && !pop.contains(e.target) && e.target !== pop) update(st.ta); }, true);
 }
 """
 
@@ -469,6 +580,202 @@ def keep_inference_audio_output():
     return gr.update()
 
 
+# ---------------------------------------------------------------- Utils tab (storage)
+STORAGE_HEADERS = ["Name", "Type", "Size", "Details", "Path"]
+
+
+def _storage_items(kind, run_key=None):
+    from higgs_local import storage
+
+    if kind == "models":
+        return [i for i in storage.scan_models() if i.size >= 1024]
+    if kind == "loras":
+        return storage.scan_loras()
+    if kind == "datasets":
+        return storage.scan_datasets()
+    if kind == "parts":
+        return storage.scan_run_parts(run_key) if run_key else []
+    return []
+
+
+def storage_view(kind, run_key=None):
+    """(table, total markdown, delete-selector update) for one section."""
+    from higgs_local import storage
+
+    items = _storage_items(kind, run_key)
+    label = {"models": "models and caches", "loras": "LoRA runs", "datasets": "datasets and downloads",
+             "parts": "this run"}[kind]
+    summary = f"**{len(items)} items · total {storage.human(storage.total(items))}** in {label}"
+    if kind == "models":
+        caches = sum(i.size for i in items if i.kind == "Cache")
+        summary += f" (caches {storage.human(caches)})"
+    choices = [(f"{i.name} · {storage.human(i.size)} · {i.key}", i.key) for i in items]
+    return storage.table(items), summary, gr.update(choices=choices, value=[])
+
+
+def storage_ask(keys, kind):
+    """First click: show the confirmation with what will be deleted."""
+    from higgs_local import storage
+
+    keys = [k for k in (keys or []) if k]
+    if not keys:
+        return [], gr.update(visible=False), "Select at least one item to delete."
+    sizes = {i.key: i for i in _storage_items(kind) if i.key in keys} if kind != "parts" else {}
+    lines = []
+    total = 0
+    for key in keys:
+        size = sizes[key].size if key in sizes else storage.dir_size(ROOT / key)
+        total += size
+        lines.append(f"- `{key}` · {storage.human(size)}")
+    warning = {
+        "models": "Deleted models download again the next time a feature needs them.",
+        "loras": "The LoRA voices, their checkpoints and training history are removed.",
+        "datasets": "The prepared clips are removed; projects keep their settings.",
+        "parts": "Deleted checkpoints can no longer be used for inference or to resume training.",
+    }[kind]
+    text = (
+        f"### ⚠️ Delete {len(keys)} item(s), {storage.human(total)}?\n{warning} **This cannot be undone.**\n\n"
+        + "\n".join(lines[:25]) + ("\n- …" if len(lines) > 25 else "")
+    )
+    return keys, gr.update(visible=True), text
+
+
+def storage_ask_keep_best(run_key):
+    from higgs_local import storage
+
+    if not run_key:
+        return [], gr.update(visible=False), "Pick a LoRA run first."
+    if not (ROOT / run_key / "checkpoint-best").exists():
+        return [], gr.update(visible=False), "This run has no `checkpoint-best`; nothing was changed."
+    targets = storage.keep_only_best_targets(run_key)
+    if not targets:
+        return [], gr.update(visible=False), "Only `checkpoint-best` is left already."
+    keys, group, text = storage_ask([t.key for t in targets], "parts")
+    text = text.replace("### ⚠️ Delete", "### ⭐ Keep only the best: delete", 1) + (
+        "\n\n`checkpoint-best` and the final adapter stay. Without numbered checkpoints this run can no longer be resumed."
+    )
+    return keys, group, text
+
+
+def _storage_guard(keys):
+    """Refuse to delete what the running training uses; unload models so Windows can delete their files."""
+    if TRAINING.is_running():
+        run = TRAINING.run_name or ""
+        for key in keys:
+            if key.startswith(("models/", "data/")) or key == f"exp/{run}" or key.startswith(f"exp/{run}/"):
+                raise RuntimeError(f"A training run ({run}) is active: stop it before deleting `{key}`.")
+    release_all_models("storage cleanup")
+
+
+def storage_delete(keys, kind, run_key=None):
+    from higgs_local import storage
+
+    keys = list(keys or [])
+    try:
+        _storage_guard(keys)
+        freed, errors = storage.delete(keys)
+        message = f"Deleted {len(keys) - len(errors)} item(s), freed {storage.human(freed)}."
+        if errors:
+            message += "\n\nCould not delete:\n" + "\n".join(f"- {e}" for e in errors)
+    except Exception as exc:
+        message = f"Nothing deleted: {exc}"
+    table, summary, selector = storage_view(kind, run_key)
+    return [], gr.update(visible=False), message, table, summary, selector
+
+
+def compare_checkpoint_choices(project):
+    choices = lora_checkpoints("v3", project) if project else []
+    return gr.update(choices=choices, value=[c[1] for c in choices[:3]])
+
+
+def compare_select_all(project):
+    return gr.update(value=[value for _label, value in lora_checkpoints("v3", project)] if project else [])
+
+
+def _compare_html(rows, text, seed, voice):
+    """Plain audio players (same look as the training eval previews)."""
+    import html as _html
+
+    from higgs_local.training_dashboard import _file_url
+
+    if not rows:
+        return '<div class="tm"><div class="tm-muted">Results appear here, one player per checkpoint.</div></div>'
+    head = (
+        f'<div class="tm-text"><b>Text:</b> “{_html.escape(text)}” · seed {seed}'
+        f' · voice {_html.escape(voice or "None")}</div>'
+    )
+    cards = []
+    for row in rows:
+        best = " best" if row["label"].startswith("Best eval") else ""
+        if row.get("path"):
+            body = f'<audio controls preload="none" src="{_file_url(row["path"])}"></audio>'
+            meta = f'{row["seconds"]:.1f} s'
+        else:
+            body, meta = "", _html.escape(row.get("error") or "generating…")
+        cards.append(
+            f'<div class="tm-audio{best}"><div class="tm-audio-tag">{_html.escape(row["label"])}</div>'
+            f'{body}<div class="tm-audio-meta">{meta}</div></div>'
+        )
+    return f'<div class="tm">{head}<div class="tm-audios">{"".join(cards)}</div></div>'
+
+
+def compare_checkpoints(project, adapters, text, voice, seed, temperature, progress=gr.Progress(track_tqdm=False)):
+    """Same text, same seed, same voice on each chosen checkpoint: the only difference is the LoRA.
+
+    WAVs are kept in exp/<run>/checkpoint_compare/<time>/ (served by the app like the eval previews)."""
+    import soundfile as sf
+
+    adapters = list(adapters or [])
+    text = (text or "").strip()
+    seed = int(seed) if seed is not None and int(seed) >= 0 else 1234
+    if not project or not adapters:
+        yield "Pick a LoRA run and at least one checkpoint.", _compare_html([], text, seed, voice)
+        return
+    if not text:
+        yield "Type the text to compare.", _compare_html([], text, seed, voice)
+        return
+    if TRAINING.is_running():
+        yield "A training run is using the GPU: wait for it to finish.", _compare_html([], text, seed, voice)
+        return
+    labels = dict((value, label) for label, value in lora_checkpoints("v3", project))
+    order = {value: i for i, (_l, value) in enumerate(lora_checkpoints("v3", project))}
+    adapters.sort(key=lambda a: order.get(a, 999))
+    out_dir = ROOT / "exp" / slugify(project, "lora") / "checkpoint_compare" / time.strftime("%Y%m%d_%H%M%S")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "prompt.txt").write_text(f"{text}\nseed={seed}\nvoice={voice}\n", encoding="utf-8")
+    rows = [{"label": labels.get(a, a)} for a in adapters]
+    for n, adapter in enumerate(adapters):
+        label = rows[n]["label"]
+        progress((n, len(adapters)), desc=f"Generating with {label}")
+        yield f"Generating {n + 1}/{len(adapters)}: **{label}** …", _compare_html(rows, text, seed, voice)
+        last_file, last_console = None, ""
+        for update in run_inference(
+            text, "Higgs V3 TTS", adapter, voice or "None", None, "",
+            float(temperature), 0.95, 50, 4096, 7, 2, seed, True, False, SEAMLESS_MODE,
+        ):
+            if isinstance(update[1], str):
+                last_file = update[1]
+            if isinstance(update[3], str):
+                last_console = update[3]
+        if last_file and Path(last_file).exists():
+            dst = out_dir / f"{n:02d}_{safe_name(label, 'checkpoint')[:60]}.wav"
+            shutil.copyfile(last_file, dst)
+            rows[n].update(path=str(dst), seconds=sf.info(str(dst)).duration)
+        else:
+            rows[n]["error"] = last_console.strip().splitlines()[-1] if last_console.strip() else "failed"
+    ok = sum(1 for r in rows if r.get("path"))
+    yield (
+        f"Done: {ok}/{len(adapters)} checkpoint(s), same text, voice and seed {seed}. Saved in `{out_dir.relative_to(ROOT).as_posix()}`.",
+        _compare_html(rows, text, seed, voice),
+    )
+
+
+def storage_run_choices():
+    from higgs_local import storage
+
+    return [(f"{i.name} · {storage.human(i.size)}", i.key) for i in storage.scan_loras()]
+
+
 def notify_done() -> None:
     """Play the completion chime."""
     sound = ROOT / "assets" / "inference_training_done.wav"
@@ -489,6 +796,15 @@ def _fmt_clock(seconds) -> str:
     minutes, sec = divmod(seconds, 60)
     hours, minutes = divmod(minutes, 60)
     return f"{hours}:{minutes:02d}:{sec:02d}" if hours else f"{minutes}:{sec:02d}"
+
+
+def _fmt_duration(seconds) -> str:
+    """Audio length for people: 9.4 s, 2:05 min, 1:02:30 h."""
+    seconds = max(0.0, float(seconds or 0))
+    if seconds < 60:
+        return f"{seconds:.1f} s"
+    clock = _fmt_clock(int(seconds + 0.5))  # half up, like the player's duration label
+    return f"{clock} h" if seconds >= 3600 else f"{clock} min"
 
 
 def progress_bar_html(percent, title: str, detail: str = "", kind: str = "run") -> str:
@@ -518,7 +834,7 @@ IDLE_PROGRESS_HTML = (
 )
 
 
-def build_segments(text: str, chunk_mode: str, gap_seconds: float = 0.5) -> list[dict]:
+def build_segments(text: str, chunk_mode: str, gap_seconds: float = 0.5, carry_tags: bool = True) -> list[dict]:
     """Text -> ordered segments ({"text", "gap"}) rendered as one continuous take.
 
     Higgs V3 stays accurate up to roughly 20-25 s of speech per pass (about 300
@@ -535,7 +851,9 @@ def build_segments(text: str, chunk_mode: str, gap_seconds: float = 0.5) -> list
         return []
     if chunk_mode != SEAMLESS_MODE:
         chunks = text_chunks_for_ui(text, chunk_mode)
-        return [{"text": c, "gap": float(gap_seconds) if i else 0.0} for i, c in enumerate(chunks)]
+        segments = [{"text": c, "gap": float(gap_seconds) if i else 0.0} for i, c in enumerate(chunks)]
+        # Speaker turns are different voices: each turn keeps only its own tags.
+        return segments if chunk_mode == "Speaker turns" or not carry_tags else carry_sentence_tags(segments)
     max_chars = 300
     segments: list[dict] = []
     for p_idx, paragraph in enumerate(p for p in _re.split(r"\n\s*\n+", text) if p.strip()):
@@ -558,6 +876,51 @@ def build_segments(text: str, chunk_mode: str, gap_seconds: float = 0.5) -> list
         for i, piece in enumerate(pieces):
             gap = 0.0 if not segments else (0.15 if i else 0.45)
             segments.append({"text": piece, "gap": gap})
+    return carry_sentence_tags(segments) if carry_tags else segments
+
+
+# Sentence-level Higgs V3 tags (they set the delivery of what follows). Inline ones
+# (sfx, prosody pause / long_pause) only mark a moment and are never carried.
+_SENTENCE_TAG = r"<\|(?:emotion|style|env|prosody:(?:speed|pitch|expressive)_[a-z_]+)(?::[a-z_]+)?\|>"
+
+
+def _tag_slot(tag: str) -> str:
+    """Category a sentence tag belongs to: a newer tag of the same slot replaces the old one."""
+    body = tag[2:-2]
+    if body.startswith("prosody:"):
+        return "prosody:" + body.split(":", 1)[1].split("_", 1)[0]  # speed / pitch / expressive
+    return body.split(":", 1)[0]  # emotion / style / env
+
+
+def _leading_sentence_tags(text: str) -> list[str]:
+    import re as _re
+
+    match = _re.match(rf"\s*((?:{_SENTENCE_TAG}\s*)+)", text or "")
+    return _re.findall(_SENTENCE_TAG, match.group(1)) if match else []
+
+
+def carry_sentence_tags(segments: list[dict]) -> list[dict]:
+    """Keep the intonation steady across segments.
+
+    Each pass of the model only sees its own text, so a segment would fall back to a
+    neutral delivery. The sentence-level tags written so far (the first segment's, plus
+    any added later) are prepended to each following segment. Tags add up per category:
+    a new emotion replaces the previous emotion, a new speed the previous speed, and so
+    on, while the other categories stay. Tags typed at the start of a segment win.
+    """
+    import re as _re
+
+    active: dict[str, str] = {}
+    for segment in segments:
+        text = segment["text"]
+        own = {_tag_slot(t) for t in _leading_sentence_tags(text)}
+        carried = "".join(tag for slot, tag in active.items() if slot not in own)
+        if carried:
+            segment["text"] = carried + text.lstrip()
+            segment["carried_tags"] = carried
+        for tag in _re.findall(_SENTENCE_TAG, text):
+            active.pop(_tag_slot(tag), None)
+            active[_tag_slot(tag)] = tag
     return segments
 
 
@@ -747,6 +1110,7 @@ def run_inference(
     reuse_chunk_seed,
     save_to_outputs,
     chunk_mode,
+    carry_tags=True,
     gap_seconds=0.5,
     progress=gr.Progress(track_tqdm=False),
 ):
@@ -860,7 +1224,11 @@ def run_inference(
         reference_note = ""
         if preset_audio and lora_adapter and lora_adapter != NONE_ADAPTER:
             reference_note = "LoRA + reference audio active; the same reference is reused for every segment."
-        segments = build_segments(text, chunk_mode, float(gap_seconds))
+        segments = build_segments(text, chunk_mode, float(gap_seconds), carry_tags=bool(carry_tags))
+        carried = [i + 1 for i, s in enumerate(segments) if s.get("carried_tags")]
+        if carried:
+            print(f"[ui] Tags carried over to keep the delivery: segment(s) {carried} -> "
+                  f"{', '.join(sorted({segments[i - 1]['carried_tags'] for i in carried}))}", flush=True)
         user_seed = int(seed)
         use_shared_seed = bool(reuse_chunk_seed) or user_seed >= 0 or len(segments) <= 1
         effective_seed = _effective_seed(seed) if use_shared_seed else -1
@@ -967,7 +1335,7 @@ def run_inference(
         notify_done()
         seconds = len(wav) / float(sr) if sr else 0.0
         elapsed = time.perf_counter() - started
-        done_label = f"Done · {seconds:.1f}s of audio in {_fmt_clock(elapsed)} ({seconds / max(elapsed, 1e-6):.2f}x realtime)"
+        done_label = f"Done · {_fmt_duration(seconds)} of audio in {_fmt_clock(elapsed)} ({seconds / max(elapsed, 1e-6):.2f}x realtime)"
         yield out(audio=fresh_audio_value(out_path), file=out_path, console=message, busy=False, bar=bar(done_label, "done"))
     except Exception as exc:
         message = f"Error: {exc}"
@@ -1050,6 +1418,7 @@ def run_dialogue(
     reuse_chunk_seed,
     save_to_outputs,
     chunk_mode,
+    carry_tags,
     row_count,
     *speaker_values,
     progress=gr.Progress(track_tqdm=False),
@@ -1077,6 +1446,12 @@ def run_dialogue(
             preset_audio, preset_text = _resolve_reference(audio, preset)
             reference_names.append(preset if preset and preset != "None" else Path(audio).stem if audio else "no_reference")
             row_chunks = text_chunks_for_ui(text, chunk_mode)
+            if carry_tags and len(row_chunks) > 1:
+                # Within one line the same speaker keeps its delivery; each line keeps only its own tags.
+                carried_segments = carry_sentence_tags([{"text": c} for c in row_chunks])
+                if any(seg.get("carried_tags") for seg in carried_segments):
+                    print(f"[ui] Dialogue row {row_idx}: tags carried over to {len(row_chunks) - 1} later chunk(s).", flush=True)
+                row_chunks = [seg["text"] for seg in carried_segments]
             for chunk_idx, chunk in enumerate(row_chunks, 1):
                 turns.append({
                     "text": _finish_sentence(chunk),
@@ -1412,15 +1787,23 @@ def project_card(project_name) -> str:
     return project_card_html(project_name, _running_project())
 
 
+DATASET_MODE_RAW = "🎙️ Raw recordings"
+DATASET_MODE_READY = "📦 Ready dataset (audio + .txt)"
+DATASET_MODE_YOUTUBE = "▶️ YouTube (yt-dlp)"
+
 _DATASET_SETTING_KEYS = (
     "source_folder", "asr_model", "language", "val_split", "recursive",
-    "isolate_voice", "segment_voice", "min_segment_sec", "max_segment_sec",
+    "clean_engine", "segment_voice", "min_segment_sec", "max_segment_sec",
+    "source_mode", "ready_path", "ready_use_split", "ready_vad_trim", "ready_min_speech", "ready_normalize",
+    "align_text", "align_drop", "youtube_urls",
 )
 
 
 def on_dataset_project_change(project_name):
     """Show the project card and restore the dataset settings saved for it."""
-    saved = load_project(project_name).get("dataset", {})
+    saved = dict(load_project(project_name).get("dataset", {}))
+    if "clean_engine" not in saved and "isolate_voice" in saved:
+        saved["clean_engine"] = "inworld" if saved["isolate_voice"] else "off"
     updates = [gr.update(value=saved[key]) if key in saved and saved[key] is not None else gr.update() for key in _DATASET_SETTING_KEYS]
     return (project_card(project_name), *updates)
 
@@ -1475,6 +1858,25 @@ def list_project_resume_choices(project_name: str | None) -> list[str]:
     for path in sorted(checkpoints, key=_checkpoint_number, reverse=True):
         choices.append(path.relative_to(ROOT).as_posix())
     return choices
+
+
+def set_live_patience(value, project_name):
+    """Patience edited while this project trains: the trainer picks it up at its next eval."""
+    try:
+        if not TRAINING.is_running() or not project_name:
+            return
+        run = slugify(project_name, "")
+        if run != TRAINING.run_name:
+            return
+        path = ROOT / "exp" / run / "live_settings.json"
+        data = {}
+        if path.exists():
+            data = json.loads(path.read_text(encoding="utf-8"))
+        data["early_stop_patience"] = max(int(value or 0), 0)
+        path.write_text(json.dumps(data), encoding="utf-8")
+        print(f"[training] Patience set to {data['early_stop_patience']} for the running {run} (next eval).", flush=True)
+    except Exception as exc:
+        print(f"[training] Could not update live patience: {exc}", flush=True)
 
 
 def resume_choice_to_state(choice):
@@ -2077,6 +2479,91 @@ def delete_training_project(project_name):
     )
 
 
+def import_dataset_choices_update(current=None):
+    from higgs_local.clip_import import dataset_choices
+
+    choices = dataset_choices()
+    return gr.update(choices=choices, value=current if current else None)
+
+
+def import_list_clips(folder):
+    from higgs_local.clip_import import clip_choices
+
+    choices, status = clip_choices(folder)
+    return gr.update(choices=choices, value=None), status
+
+
+def import_browse_folder(current):
+    folder, _msg = browse_source_folder(current or str(ROOT / "data"))
+    return gr.update(value=folder) if folder else gr.update()
+
+
+def import_load_clip(audio_path, folder):
+    """(audio, transcript, status, sample-name suggestion) for the chosen dataset clip."""
+    from higgs_local.clip_import import servable_copy, text_for_clip
+
+    if not audio_path:
+        return gr.update(), gr.update(), gr.update(), gr.update()
+    text = text_for_clip(audio_path, folder)
+    if not text:
+        return gr.update(), gr.update(), f"`{Path(audio_path).name}` has no transcript.", gr.update()
+    return servable_copy(audio_path), text, f"Loaded `{Path(audio_path).name}`.", Path(audio_path).stem[:60]
+
+
+def import_pick_pair(folder):
+    from higgs_local.clip_import import pick_pair_dialog, servable_copy
+
+    start = str(ROOT / folder) if folder and not os.path.isabs(str(folder)) else (folder or "")
+    try:
+        audio, text, status = pick_pair_dialog(start)
+    except Exception as exc:
+        return gr.update(), gr.update(), f"File picker error: {exc}", gr.update()
+    if not audio:
+        return gr.update(), gr.update(), status, gr.update()
+    return servable_copy(audio), text, status, Path(audio).stem[:60]
+
+
+def clip_import_block(label="📥 Import audio + transcript from a dataset"):
+    """Dataset / folder / file picker that fills an audio + transcript pair. Returns its components."""
+    from higgs_local.clip_import import dataset_choices
+
+    with gr.Accordion(label, open=False):
+        with gr.Row(equal_height=True):
+            ds = gr.Dropdown(
+                dataset_choices(),
+                value=None,
+                allow_custom_value=True,
+                label="Higgs dataset or any folder",
+                info="data/<project>/train|eval, or paste a folder path with audio + .txt pairs (metadata.jsonl also works).",
+                scale=6,
+            )
+            folder_btn = gr.Button("📁", scale=1, min_width=48, variant="secondary")
+            refresh_btn = gr.Button("🔄", scale=1, min_width=48, variant="secondary")
+        clip = gr.Dropdown([], value=None, label="Clip (type to search: name, length, text)", filterable=True)
+        with gr.Row(equal_height=True):
+            file_btn = gr.Button("🎵 Pick an audio file (+ .txt) from anywhere…", variant="secondary", size="sm")
+        status = gr.Markdown("Only clips with a transcript are listed.", elem_classes="hint")
+    return ds, folder_btn, refresh_btn, clip, file_btn, status
+
+
+def wire_clip_import(parts, audio_out, text_out, name_out=None):
+    ds, folder_btn, refresh_btn, clip, file_btn, status = parts
+    outputs = [audio_out, text_out, status] + ([name_out] if name_out is not None else [])
+
+    def trim(fn):
+        def run(*args):
+            result = fn(*args)
+            return result if name_out is not None else result[:3]
+
+        return run
+
+    ds.change(import_list_clips, ds, [clip, status], queue=False, show_progress="hidden")
+    folder_btn.click(import_browse_folder, ds, ds, queue=False)
+    refresh_btn.click(import_dataset_choices_update, ds, ds, queue=False)
+    clip.change(trim(import_load_clip), [clip, ds], outputs, queue=False, show_progress="hidden")
+    file_btn.click(trim(import_pick_pair), ds, outputs, queue=False)
+
+
 def load_sample_for_ui(name, use_ref_text=True):
     audio, text = resolve_voice(name)
     return audio, text if use_ref_text else ""
@@ -2119,20 +2606,82 @@ def prepare_higgs_dataset(
     asr_batch_size,
     val_split,
     recursive,
-    isolate_voice=True,
+    clean_engine="inworld",
     segment_voice=True,
     min_segment_sec=2.0,
     max_segment_sec=15.0,
+    source_mode=DATASET_MODE_RAW,
+    ready_path="",
+    ready_use_split=True,
+    ready_vad_trim=True,
+    ready_min_speech=0.0,
+    ready_normalize=True,
+    align_text=True,
+    align_drop=True,
+    youtube_urls="",
     progress=gr.Progress(track_tqdm=False),
 ):
     try:
-        from higgs_local.dataset_audio import SegmentOptions
+        from higgs_local.dataset_audio import CleanOptions, SegmentOptions
 
+        if clean_engine is True or clean_engine is None:  # legacy checkbox value
+            clean_engine = "inworld"
+        elif clean_engine is False:
+            clean_engine = "off"
+        clean_engine = str(clean_engine or "off")
         release_all_models("dataset build")
+        if source_mode == DATASET_MODE_READY:
+            from higgs_local.ready_dataset import import_ready_dataset
+
+            if not (dataset_name or "").strip():
+                raise ValueError("Type a project name for the imported dataset.")
+            summary, import_report = import_ready_dataset(
+                ready_path,
+                dataset_name,
+                val_split=float(val_split),
+                language=asr_language,
+                clean_options=CleanOptions(
+                    engine=clean_engine,
+                    vad_trim=bool(ready_vad_trim),
+                    min_speech_ratio=float(ready_min_speech or 0.0),
+                    normalize=bool(ready_normalize),
+                ),
+                use_metadata_split=bool(ready_use_split),
+                progress=lambda fraction, desc: progress(fraction, desc=desc),
+            )
+            summary, align_report = _align_dataset_step(summary, asr_language, align_text, align_drop, progress)
+            return _dataset_build_done(
+                summary,
+                "\n".join(part for part in (import_report, align_report) if part),
+                {
+                    "align_text": bool(align_text),
+                    "align_drop": bool(align_drop),
+                    "source_mode": DATASET_MODE_READY,
+                    "ready_path": ready_path,
+                    "ready_use_split": bool(ready_use_split),
+                    "ready_vad_trim": bool(ready_vad_trim),
+                    "ready_min_speech": float(ready_min_speech or 0.0),
+                    "ready_normalize": bool(ready_normalize),
+                    "clean_engine": clean_engine,
+                    "language": asr_language,
+                    "val_split": float(val_split),
+                },
+            )
+        youtube_report = ""
+        if source_mode == DATASET_MODE_YOUTUBE:
+            if not (dataset_name or "").strip():
+                raise ValueError("Type a project name before downloading from YouTube.")
+            result = _download_youtube(dataset_name, youtube_urls, progress)
+            youtube_report = _youtube_report(result)
+            if not any(result.folder.glob("*.wav")):
+                raise RuntimeError("Nothing was downloaded.\n" + youtube_report)
+            source_folder, recursive = str(result.folder), False
         ensure_asr_for_flow(asr_model, progress)
         min_sec = float(min_segment_sec)
         max_sec = max(float(max_segment_sec), min_sec + 1.0)
-        audio_options = SegmentOptions(isolate=bool(isolate_voice), segment=bool(segment_voice), min_sec=min_sec, max_sec=max_sec)
+        audio_options = SegmentOptions(
+            isolate=clean_engine != "off", engine=clean_engine, segment=bool(segment_voice), min_sec=min_sec, max_sec=max_sec
+        )
 
         def asr_transcribe(audio_path: str) -> str:
             text, status = ASR.transcribe(audio_path, asr_model, asr_language)
@@ -2162,58 +2711,26 @@ def prepare_higgs_dataset(
             progress=lambda fraction, desc: progress(fraction, desc=desc),
             audio_options=audio_options,
         )
-        release_all_models("dataset build finished")
-        project = summary.dataset_dir.name
-        save_project_section(
-            project,
-            "dataset",
+        release_all_models("dataset asr finished")
+        summary, align_report = _align_dataset_step(summary, asr_language, align_text, align_drop, progress)
+        return _dataset_build_done(
+            summary,
+            "\n".join(part for part in (youtube_report, align_report) if part),
             {
+                "align_text": bool(align_text),
+                "align_drop": bool(align_drop),
+                "source_mode": source_mode if source_mode == DATASET_MODE_YOUTUBE else DATASET_MODE_RAW,
+                "youtube_urls": youtube_urls or "",
                 "source_folder": source_folder,
                 "asr_model": asr_model,
                 "language": asr_language,
                 "val_split": float(val_split),
                 "recursive": bool(recursive),
-                "isolate_voice": bool(isolate_voice),
+                "clean_engine": clean_engine,
                 "segment_voice": bool(segment_voice),
                 "min_segment_sec": float(min_segment_sec),
                 "max_segment_sec": float(max_segment_sec),
-                "train_clips": summary.train_samples,
-                "eval_clips": summary.eval_samples,
-                "minutes": round(summary.total_duration / 60.0, 2),
-                "built_at": time.strftime("%Y-%m-%d %H:%M"),
             },
-        )
-        ok_train, train_report = validate_higgs_dataset(summary.train_dir)
-        eval_report = ""
-        if summary.eval_dir:
-            _, eval_report = validate_higgs_dataset(summary.eval_dir)
-        datasets = list_train_datasets()
-        notify_done()
-        message = (
-            f"Higgs dataset ready: {summary.dataset_dir}\n"
-            "Training format: single-speaker WAV/TXT pairs\n"
-            f"Train: {summary.train_samples} samples\n"
-            f"Eval: {summary.eval_samples} samples\n"
-            f"Duration: {summary.total_duration / 3600:.3f} h, avg {summary.avg_duration:.2f}s\n"
-            f"Languages: {', '.join(summary.languages)}\n"
-            f"Speakers: {', '.join(summary.speakers)}\n\n"
-            f"{train_report}"
-        )
-        if eval_report:
-            message += f"\n\n{eval_report}"
-        if not ok_train:
-            message = "Dataset created but train validation found issues.\n" + message
-        return (
-            gr.update(choices=datasets, value=summary.train_dir.relative_to(ROOT).as_posix()),
-            gr.update(choices=[""] + datasets, value=summary.eval_dir.relative_to(ROOT).as_posix() if summary.eval_dir else ""),
-            message,
-            f"### Dataset Build\nDone: {summary.train_samples} train / {summary.eval_samples} eval samples. "
-            f"Project **{project}** is selected in Training with this dataset.",
-            gr.update(value="Build Higgs Dataset", interactive=True, variant="primary"),
-            gr.update(interactive=False),
-            gr.update(choices=list_projects(), value=project),
-            project_card(project),
-            gr.update(choices=list_projects(), value=project),
         )
     except Exception as exc:
         import traceback
@@ -2225,13 +2742,153 @@ def prepare_higgs_dataset(
             gr.update(),
             gr.update(),
             message,
-            "### Dataset Build\nFailed.",
+            f"### Dataset Build\nFailed: {exc}",
             gr.update(value="Build Higgs Dataset", interactive=True, variant="primary"),
             gr.update(interactive=False),
             gr.update(),
             gr.update(),
             gr.update(),
         )
+
+
+def _youtube_folder(dataset_name):
+    from higgs_local.training_utils import slugify
+    from higgs_local.youtube import DOWNLOADS_DIR
+
+    return DOWNLOADS_DIR / slugify(dataset_name)
+
+
+def _download_youtube(dataset_name, youtube_urls, progress):
+    from higgs_local.youtube import download_audio
+
+    return download_audio(
+        youtube_urls,
+        _youtube_folder(dataset_name),
+        progress=lambda fraction, desc: progress(fraction, desc=desc),
+    )
+
+
+def _youtube_report(result):
+    total = len(list(result.folder.glob("*.wav")))
+    lines = [f"YouTube: {len(result.files)} new audio file(s), {total} in total in {result.folder}"]
+    if result.errors:
+        lines.append("Download problems:\n  " + "\n  ".join(result.errors[:10]))
+    return "\n".join(lines)
+
+
+def download_youtube_ui(dataset_name, youtube_urls, progress=gr.Progress(track_tqdm=False)):
+    """Download only (the build also downloads whatever is missing)."""
+    from higgs_local.youtube import describe_folder
+
+    try:
+        if not (dataset_name or "").strip():
+            return "Type a project name first: audio is saved in `downloads/<project>`."
+        result = _download_youtube(dataset_name, youtube_urls, progress)
+        return _youtube_report(result).replace("\n", "  \n") + "\n\n" + describe_folder(result.folder)
+    except Exception as exc:
+        return f"Download failed: {exc}"
+
+
+def describe_youtube_ui(dataset_name):
+    from higgs_local.youtube import describe_folder
+
+    if not (dataset_name or "").strip():
+        return "Paste YouTube links (videos, playlists or channels), one per line. Add `1:20-5:00` after a link to take only that part."
+    return describe_folder(_youtube_folder(dataset_name))
+
+
+def _align_dataset_step(summary, language, align_text, align_drop, progress):
+    """Optional Qwen3-ForcedAligner pass over the built clips: tight edges, drop text/audio mismatches."""
+    if not align_text:
+        return summary, ""
+    from dataclasses import replace
+
+    from higgs_local.aligner import AlignOptions, align_dataset, resolve_language
+
+    code, supported = resolve_language(language)
+    if not supported:
+        return summary, f"Text alignment skipped: Qwen3-ForcedAligner does not support '{language}'."
+    split_dirs = [summary.train_dir] + ([summary.eval_dir] if summary.eval_dir else [])
+    report, _kept = align_dataset(
+        split_dirs,
+        language,
+        AlignOptions(trim=True, drop_mismatch=bool(align_drop)),
+        progress=lambda fraction, desc: progress(fraction, desc=desc),
+    )
+    from higgs_local.training_utils import write_metadata
+
+    samples, created_from = [], []
+    counts = {}
+    for split_dir in split_dirs:
+        meta = json.loads((split_dir / "metadata.json").read_text(encoding="utf-8"))
+        counts[split_dir] = len(meta.get("samples") or [])
+        samples.extend(meta.get("samples") or [])
+        created_from = created_from or list((meta.get("dataset_info") or {}).get("created_from") or [])
+    if not counts.get(summary.train_dir):
+        raise RuntimeError("Text alignment dropped every train clip: the transcripts do not match the audio.")
+    write_metadata(summary.dataset_dir, samples, created_from)
+    total = sum(float(sample.get("duration", 0.0)) for sample in samples)
+    eval_dir = summary.eval_dir if summary.eval_dir and counts.get(summary.eval_dir) else None
+    summary = replace(
+        summary,
+        eval_dir=eval_dir,
+        train_samples=counts[summary.train_dir],
+        eval_samples=counts.get(summary.eval_dir, 0) if eval_dir else 0,
+        total_duration=total,
+        avg_duration=total / max(len(samples), 1),
+    )
+    return summary, "\n".join(report)
+
+
+def _dataset_build_done(summary, extra_report: str, settings: dict):
+    """Common finish for building from recordings and importing a ready dataset."""
+    release_all_models("dataset build finished")
+    project = summary.dataset_dir.name
+    save_project_section(
+        project,
+        "dataset",
+        {
+            **settings,
+            "train_clips": summary.train_samples,
+            "eval_clips": summary.eval_samples,
+            "minutes": round(summary.total_duration / 60.0, 2),
+            "built_at": time.strftime("%Y-%m-%d %H:%M"),
+        },
+    )
+    ok_train, train_report = validate_higgs_dataset(summary.train_dir)
+    eval_report = ""
+    if summary.eval_dir:
+        _, eval_report = validate_higgs_dataset(summary.eval_dir)
+    datasets = list_train_datasets()
+    notify_done()
+    message = (
+        f"Higgs dataset ready: {summary.dataset_dir}\n"
+        "Training format: single-speaker WAV/TXT pairs\n"
+        f"Train: {summary.train_samples} samples\n"
+        f"Eval: {summary.eval_samples} samples\n"
+        f"Duration: {summary.total_duration / 3600:.3f} h, avg {summary.avg_duration:.2f}s\n"
+        f"Languages: {', '.join(summary.languages)}\n"
+        f"Speakers: {', '.join(summary.speakers)}\n\n"
+        f"{train_report}"
+    )
+    if eval_report:
+        message += f"\n\n{eval_report}"
+    if extra_report:
+        message = f"{extra_report}\n\n{message}"
+    if not ok_train:
+        message = "Dataset created but train validation found issues.\n" + message
+    return (
+        gr.update(choices=datasets, value=summary.train_dir.relative_to(ROOT).as_posix()),
+        gr.update(choices=[""] + datasets, value=summary.eval_dir.relative_to(ROOT).as_posix() if summary.eval_dir else ""),
+        message,
+        f"### Dataset Build\nDone: {summary.train_samples} train / {summary.eval_samples} eval samples. "
+        f"Project **{project}** is selected in Training with this dataset.",
+        gr.update(value="Build Higgs Dataset", interactive=True, variant="primary"),
+        gr.update(interactive=False),
+        gr.update(choices=list_projects(), value=project),
+        project_card(project),
+        gr.update(choices=list_projects(), value=project),
+    )
 
 
 def browse_source_folder(current_value=""):
@@ -2249,6 +2906,60 @@ def browse_source_folder(current_value=""):
         return current_value, "Folder selection cancelled."
     except Exception as exc:
         return current_value, f"Folder picker error: {exc}"
+
+
+def browse_ready_dataset(kind, current_value=""):
+    """Native picker for a ready dataset: a folder or a .zip archive."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        start = current_value.strip().strip('"') if current_value else ""
+        start_dir = start if start and Path(start).is_dir() else (str(Path(start).parent) if start else str(ROOT))
+        if kind == "zip":
+            selected = filedialog.askopenfilename(
+                initialdir=start_dir, title="Choose a dataset .zip", filetypes=[("Zip archive", "*.zip"), ("All files", "*.*")]
+            )
+        else:
+            selected = filedialog.askdirectory(initialdir=start_dir, title="Choose a dataset folder")
+        root.destroy()
+        if selected:
+            selected = str(Path(selected))
+            return selected, describe_ready_dataset(selected)
+        return current_value, gr.update()
+    except Exception as exc:
+        return current_value, f"⚠️ Picker error: {exc}"
+
+
+def describe_ready_dataset(path):
+    if not (path or "").strip():
+        return "Enter or pick a folder / .zip with audio + `.txt` pairs (an optional `metadata.jsonl` is used when present)."
+    from higgs_local.ready_dataset import describe_ready_source
+
+    return describe_ready_source(path)
+
+
+def on_dataset_mode_change(mode, engine):
+    ready = mode == DATASET_MODE_READY
+    youtube = mode == DATASET_MODE_YOUTUBE
+    # Ready datasets are usually clean already: default their clean-up to off.
+    new_engine = engine
+    if ready and engine == "inworld":
+        new_engine = "off"
+    elif not ready and engine == "off":
+        new_engine = "inworld"
+    return (
+        gr.update(visible=not ready and not youtube),
+        gr.update(visible=ready),
+        gr.update(visible=not ready),
+        gr.update(visible=ready),
+        gr.update(visible=not ready),
+        gr.update(value=new_engine),
+        gr.update(visible=youtube),
+    )
 
 
 def add_eval_sample_to_dataset(train_data_dir, eval_data_dir, eval_text, eval_audio, eval_ref_text):
@@ -2636,6 +3347,43 @@ TAG_CATALOG = {
 }
 
 
+TAG_HINTS = {
+    "emotion": "sentence start",
+    "prosody": "sentence start",
+    "style": "sentence start",
+    "env": "sentence start",
+    "sfx": "inline · sound word right after",
+}
+SFX_SOUNDS = {
+    "cough": ["Ahem"], "laughter": ["Haha", "Hehe"], "crying": ["Boohoo", "Sob"],
+    "screaming": ["Ahh", "Aaah"], "burping": ["Burp"], "humming": ["Hmm", "Mmm"],
+    "sigh": ["Uh", "Ahh"], "sniff": ["Sff"], "sneeze": ["Achoo"],
+}
+V2_EVENT_TAGS = [
+    ("[laugh]", "instant"), ("[music]", "instant"), ("[applause]", "instant"), ("[cheering]", "instant"),
+    ("[cough]", "instant"), ("[humming start]", "start"), ("[humming end]", "end"), ("[music start]", "start"),
+    ("[music end]", "end"), ("[sing start]", "start"), ("[sing end]", "end"),
+]
+
+
+def tag_autocomplete_catalog() -> dict:
+    """Tags offered by the @ autocomplete, per model (same lists as the reference accordion)."""
+    v3 = []
+    for category, values in TAG_CATALOG.items():
+        for value in values:
+            tag = f"<|{category}:{value}|>"
+            hint = TAG_HINTS.get(category, "")
+            if category == "prosody" and value in ("pause", "long_pause"):
+                hint = "inline"
+            if category == "sfx":
+                for sound in SFX_SOUNDS.get(value, [""]):
+                    v3.append({"label": tag + sound, "insert": tag + sound, "cat": category, "hint": hint})
+            else:
+                v3.append({"label": tag, "insert": tag, "cat": category, "hint": hint})
+    v2 = [{"label": tag, "insert": tag, "cat": "event", "hint": kind} for tag, kind in V2_EVENT_TAGS]
+    return {"Higgs V3 TTS": v3, "Higgs V2 TTS": v2}
+
+
 def tag_reference_text() -> str:
     return """## Higgs V3 Tags
 
@@ -2819,6 +3567,8 @@ def chunk_mode_reference_text() -> str:
 - **Speaker turns**: keeps `[SPEAKER0]`, `[SPEAKER1]` style turns separated when possible.
 
 Changing chunk mode changes how many clips are generated and joined.
+
+**Tags across segments:** each segment is generated on its own, so sentence-level V3 tags (emotion, style, prosody speed / pitch / expressive) are carried to the next segments to keep the same delivery (turn it off with **Carry tags across segments**). New tags add up: a new emotion replaces the previous emotion (same for style, speed, pitch and expressiveness) while the other tags stay. Sound effects and pauses are never repeated. Speaker turns keep only their own tags.
 """
 
 
@@ -2858,12 +3608,13 @@ def build_ui():
                                         placeholder=(
                                             "Type or paste what the voice should say. Long texts are fine: they are split "
                                             "into natural segments and joined into one continuous take.\n\n"
-                                            "Tip: Higgs V3 control tokens like <|emotion:elation|> go inline."
+                                            "Tip: type @ anywhere to insert a tag (emotion, style, prosody, sound effect) "
+                                            "supported by the selected model."
                                         ),
                                         lines=10,
                                         max_lines=30,
                                         value="",
-                                        elem_classes=["script-box"],
+                                        elem_classes=["script-box", "tag-ac"],
                                     )
                                     infer_clips_count = gr.Markdown(value="", elem_classes="text-stats")
                                     with gr.Row(equal_height=True):
@@ -2918,6 +3669,7 @@ def build_ui():
                                 gr.HTML(section("Voice"))
                                 infer_model_select = gr.Dropdown(
                                     label="Model",
+                                    elem_id="infer-model-select",
                                     choices=MODEL_CHOICES,
                                     value="Higgs V3 TTS",
                                 )
@@ -2949,6 +3701,7 @@ def build_ui():
                                         scale=6,
                                     )
                                     refresh_infer_sample_btn = gr.Button("🔄", scale=1, min_width=48, variant="secondary")
+                                infer_import_parts = clip_import_block("📥 Use a clip from a dataset or folder (audio + .txt)")
                                 infer_ref_audio = gr.Audio(
                                     label="Reference audio · 5–30 s",
                                     type="filepath",
@@ -3005,6 +3758,12 @@ def build_ui():
                                         label="Reuse one seed across segments",
                                         value=True,
                                         info="Keeps the voice steadier when the text is split.",
+                                    )
+                                    infer_carry_tags = gr.Checkbox(
+                                        label="Carry tags across segments",
+                                        value=True,
+                                        info="Repeats the sentence-level V3 tags (emotion, style, speed, pitch...) on the next "
+                                        "segments so the intonation doesn't reset after a split. New tags add up.",
                                     )
                                     with gr.Accordion("How the split modes work", open=False):
                                         gr.Markdown(chunk_mode_reference_text())
@@ -3123,6 +3882,7 @@ def build_ui():
                                         label=f"Line {i + 1}",
                                         scale=7,
                                         lines=3,
+                                        elem_classes=["tag-ac"],
                                     )
                                     with gr.Column(scale=1, min_width=64):
                                         add_btn = gr.Button("＋", variant="secondary", size="sm", elem_classes=["green-btn"])
@@ -3163,7 +3923,8 @@ def build_ui():
                             )
                             dialogue_file_out = gr.Textbox(label="Saved WAV", interactive=False, elem_classes=["output-path"])
                         gr.Markdown(
-                            "Uses the model, LoRA and sampling settings from **Single voice**.",
+                            "Uses the model, LoRA, sampling, long-text mode and *Carry tags across segments* settings from **Single voice** "
+                            "(tags carry between the chunks of one line; each line keeps its own tags).",
                             elem_classes="hint",
                         )
 
@@ -3189,6 +3950,7 @@ def build_ui():
 
                     with gr.Column(scale=2, elem_classes="card"):
                         gr.HTML(section("Editor"))
+                        prep_import_parts = clip_import_block("📥 Import from a dataset or folder (audio + .txt)")
                         prep_audio_player = gr.Audio(
                             label="Audio · 5–30 s recommended (use the trim icon to edit)",
                             type="filepath",
@@ -3242,7 +4004,9 @@ def build_ui():
                 gr.Markdown(
                     "Point it at a folder of recordings of one speaker (any length, any format). The builder isolates the voice, "
                     "cuts natural speech segments, normalises loudness and transcribes them verbatim. Files that already have a "
-                    "sidecar `.txt` / `.json` transcript are cleaned but kept whole.",
+                    "sidecar `.txt` / `.json` transcript are cleaned but kept whole. Already have clips + transcripts? "
+                    "Choose **📦 Ready dataset** and point it at the folder or `.zip`. Optionally, Qwen3-ForcedAligner "
+                    "checks every transcript against its audio and trims the clip to the spoken words.",
                     elem_classes="hint",
                 )
                 with gr.Row(equal_height=True):
@@ -3258,33 +4022,103 @@ def build_ui():
                 dataset_project_card = gr.HTML(project_card_html(None))
                 with gr.Row():
                     with gr.Column(scale=1, elem_classes="form-section"):
-                        gr.Markdown("#### 📁 Folder Selection")
-                        with gr.Row():
-                            src_folder = gr.Textbox(label="Source Audio Folder", placeholder="J:\\path\\to\\audio_folder", scale=5)
-                            browse_src_folder_btn = gr.Button("Search Folder", scale=1, min_width=130)
-                        recursive_dataset = gr.Checkbox(label="Scan subfolders", value=True)
+                        gr.Markdown("#### 📁 Source")
+                        dataset_source_mode = gr.Radio(
+                            [DATASET_MODE_RAW, DATASET_MODE_YOUTUBE, DATASET_MODE_READY],
+                            value=DATASET_MODE_RAW,
+                            label="What do you have?",
+                            info="Raw recordings and YouTube audio are segmented and transcribed. "
+                            "A ready dataset already has its clips and transcripts.",
+                        )
+                        with gr.Group(visible=False) as youtube_source_group:
+                            youtube_urls = gr.Textbox(
+                                label="YouTube links (one per line)",
+                                lines=3,
+                                placeholder="https://www.youtube.com/watch?v=...\nhttps://youtu.be/... 1:20-5:00\nhttps://www.youtube.com/playlist?list=...",
+                                info="Videos, playlists or channels. Optional `start-end` after a link keeps only that part. "
+                                "Use only content you have the rights to train on.",
+                            )
+                            with gr.Row():
+                                youtube_download_btn = gr.Button("⬇️ Download audio", size="sm", min_width=130)
+                                youtube_check_btn = gr.Button("🔍 Show downloaded", size="sm", min_width=130)
+                            youtube_md = gr.Markdown(
+                                "Audio is saved in `downloads/<project>` and reused on the next build. "
+                                "**Build Higgs Dataset** downloads whatever is missing, then segments and transcribes it.",
+                                elem_classes="hint",
+                            )
+                        with gr.Group(visible=True) as raw_source_group:
+                            with gr.Row():
+                                src_folder = gr.Textbox(label="Source Audio Folder", placeholder="J:\\path\\to\\audio_folder", scale=5)
+                                browse_src_folder_btn = gr.Button("Search Folder", scale=1, min_width=130)
+                            recursive_dataset = gr.Checkbox(label="Scan subfolders", value=True)
+                        with gr.Group(visible=False) as ready_source_group:
+                            ready_path = gr.Textbox(
+                                label="Ready dataset (folder or .zip)",
+                                placeholder="R:\\dataset   or   R:\\dataset.zip",
+                                info="Audio + .txt pairs with the same name. metadata.jsonl / LICENSE are optional; "
+                                "when metadata.jsonl exists it is used (text, keep flag, train/eval split).",
+                            )
+                            with gr.Row():
+                                ready_browse_dir_btn = gr.Button("📁 Folder", size="sm", min_width=90)
+                                ready_browse_zip_btn = gr.Button("🗜️ .zip", size="sm", min_width=90)
+                                ready_scan_btn = gr.Button("🔍 Scan", size="sm", min_width=90)
+                            ready_use_split = gr.Checkbox(
+                                label="Use the train/eval split from metadata.jsonl",
+                                value=True,
+                                info="Off, or no split column: the Validation Split slider picks evenly spread eval clips.",
+                            )
+                            ready_scan_md = gr.Markdown(
+                                "Enter or pick a folder / .zip with audio + `.txt` pairs (an optional `metadata.jsonl` is used when present).",
+                                elem_classes="hint",
+                            )
                     with gr.Column(scale=1, elem_classes="form-section"):
                         gr.Markdown("#### 🛰️ ASR & Split")
-                        dataset_asr_model = gr.Dropdown(ASR_CHOICES, value=DEFAULT_ASR_MODEL, label="ASR Model")
+                        dataset_asr_model = gr.Dropdown(ASR_CHOICES, value=DEFAULT_ASR_MODEL, label="ASR Model", info="Not used for ready datasets.")
                         dataset_asr_lang = gr.Dropdown(list(WHISPER_LANGS), value="Auto-detect", label="Language")
                         dataset_asr_batch = gr.Slider(1, 32, value=8, step=1, label="ASR batch size", visible=False)
                         val_split_slider = gr.Slider(0.0, 0.5, value=0.1, step=0.05, label="Validation Split")
                     with gr.Column(scale=1, elem_classes="form-section"):
                         gr.Markdown("#### 🎧 Clean-up & Segmentation")
-                        dataset_isolate = gr.Checkbox(
-                            label="Isolate voice (Inworld Voice Isolator)",
-                            value=True,
-                            info="Removes background noise and music, keeps the foreground voice.",
+                        dataset_isolate = gr.Dropdown(
+                            CLEAN_ENGINES,
+                            value="inworld",
+                            label="Voice clean-up / separation",
+                            info="Removes music, noise or background voices. RoFormer models download once (~0.2–0.9 GB each).",
                         )
-                        dataset_segment = gr.Checkbox(
-                            label="Split into natural segments (Inworld SAVA)",
-                            value=True,
-                            info="Voice-activity + end-of-turn model; long turns are cut at the deepest pause.",
-                        )
+                        with gr.Group(visible=True) as raw_segment_group:
+                            dataset_segment = gr.Checkbox(
+                                label="Split into natural segments (Inworld SAVA)",
+                                value=True,
+                                info="Voice-activity + end-of-turn model; long turns are cut at the deepest pause.",
+                            )
+                            with gr.Row():
+                                dataset_min_sec = gr.Slider(1.0, 8.0, value=2.0, step=0.5, label="Min segment (s)")
+                                dataset_max_sec = gr.Slider(6.0, 25.0, value=15.0, step=0.5, label="Max segment (s)")
+                        with gr.Group(visible=False) as ready_clean_group:
+                            ready_vad_trim = gr.Checkbox(
+                                label="Trim edge silence (SAVA voice activity)",
+                                value=True,
+                                info="Cuts only the silence before the first and after the last word, so the text stays aligned.",
+                            )
+                            ready_min_speech = gr.Slider(
+                                0.0, 0.8, value=0.0, step=0.05,
+                                label="Drop clips with less speech than",
+                                info="Share of the clip with detected voice. 0 = keep all; 0.3–0.5 drops music/noise-only clips.",
+                            )
+                            ready_normalize = gr.Checkbox(label="Normalize loudness (-20 LUFS)", value=True)
                         with gr.Row():
-                            dataset_min_sec = gr.Slider(1.0, 8.0, value=2.0, step=0.5, label="Min segment (s)")
-                            dataset_max_sec = gr.Slider(6.0, 25.0, value=15.0, step=0.5, label="Max segment (s)")
-                        gr.Markdown(
+                            dataset_align = gr.Checkbox(
+                                label="Align text to audio (Qwen3-ForcedAligner)",
+                                value=True,
+                                info="Places every word in time: trims each clip to its first / last word. "
+                                "11 languages; downloads once (~1.8 GB).",
+                            )
+                            dataset_align_drop = gr.Checkbox(
+                                label="Drop clips whose text does not match",
+                                value=True,
+                                info="Removes clips where the aligner cannot place the words (wrong or partial transcript).",
+                            )
+                        dataset_segment_hint = gr.Markdown(
                             "3–15 s clips train Higgs V3 best: it reads up to ~25 s reliably per pass.",
                             elem_classes="hint",
                         )
@@ -3352,14 +4186,23 @@ def build_ui():
                             train_logging_steps = gr.Number(value=DEFAULT_TRAINING_24GB["logging_steps"], precision=0, label="Logging steps")
                             train_save_steps = gr.Number(value=DEFAULT_TRAINING_24GB["save_steps"], precision=0, label="Save steps")
                             train_eval_steps = gr.Number(value=DEFAULT_TRAINING_24GB["eval_steps"], precision=0, label="Eval steps")
-                        resume_checkpoint_choice = gr.Dropdown(
-                            choices=["None"],
-                            value="None",
-                            label="Resume checkpoint",
-                        )
+                        with gr.Row():
+                            resume_checkpoint_choice = gr.Dropdown(
+                                choices=["None"],
+                                value="None",
+                                label="Resume checkpoint",
+                                scale=3,
+                            )
+                            v3_patience = gr.Number(
+                                value=3, precision=0, label="Early-stop patience (evals)", scale=2,
+                                info="Evals without improvement before stopping (0 = never). "
+                                "Can be changed on resume and while training: applied at the next eval.",
+                            )
                         gr.Markdown(
                             "Existing projects auto-select their latest restorable checkpoint from `exp/<project>`. "
-                            "Choose `None` to retrain from scratch."
+                            "Choose `None` to retrain from scratch. A resumed run keeps everything: optimizer state, "
+                            "LR position (no new warmup), best eval, patience counter and the same charts. "
+                            "Raise **Epochs** to train past the planned end; the LR then keeps decaying from where it was."
                         )
                 with gr.Accordion("🧪 V3 recipe (advanced)", open=False, elem_classes="accordion"):
                     gr.Markdown(
@@ -3401,10 +4244,6 @@ def build_ui():
                         v3_max_clip = gr.Slider(8, 40, value=30, step=1, label="Skip clips longer than (s)")
                     gr.Markdown("**Anti-overfitting**", elem_classes="hint")
                     with gr.Row():
-                        v3_patience = gr.Number(
-                            value=3, precision=0, label="Early-stop patience (evals)",
-                            info="Stop after this many evals without improvement. 0 = never stop early.",
-                        )
                         v3_min_delta = gr.Number(
                             value=0.002, label="Min improvement (relative)",
                             info="0.002 = an eval must beat the best by 0.2 % to count as progress.",
@@ -3452,6 +4291,107 @@ def build_ui():
                     visible=False,
                 )
                 training_timer = gr.Timer(2.0, active=True) if hasattr(gr, "Timer") else None
+
+            # ================================================================ UTILS
+            with gr.Tab("🧰 Utils", id="tab_utils"):
+                gr.Markdown(
+                    "Disk space used by the app. Everything lives inside the app folder. Deleting always asks for "
+                    "confirmation first; deleted models download again when a feature needs them.",
+                    elem_classes="hint",
+                )
+                storage_sections = {}
+                for kind, title in (("models", "🧠 Models & caches"), ("loras", "🧬 LoRA runs"), ("datasets", "📂 Datasets")):
+                    with gr.Accordion(title, open=kind == "models", elem_classes="accordion"):
+                        with gr.Row(equal_height=True):
+                            total_md = gr.Markdown("Press 🔄 Scan to measure.")
+                            scan_btn = gr.Button("🔄 Scan", size="sm", variant="secondary", scale=0, min_width=110)
+                        tbl = gr.Dataframe(headers=STORAGE_HEADERS, value=[], interactive=False, wrap=True)
+                        with gr.Row(equal_height=True):
+                            pick = gr.Dropdown([], value=[], multiselect=True, label="Select items to delete", scale=6)
+                            del_btn = gr.Button("🗑️ Delete selected", variant="stop", scale=1, min_width=150)
+                        storage_sections[kind] = (total_md, scan_btn, tbl, pick, del_btn)
+                        if kind == "loras":
+                            gr.Markdown("#### Checkpoints of one run")
+                            with gr.Row(equal_height=True):
+                                run_pick = gr.Dropdown([], value=None, label="LoRA run", scale=5)
+                                keep_best_btn = gr.Button("⭐ Keep only best", variant="secondary", scale=1, min_width=150)
+                            parts_md = gr.Markdown("")
+                            parts_tbl = gr.Dataframe(headers=STORAGE_HEADERS, value=[], interactive=False, wrap=True)
+                            with gr.Row(equal_height=True):
+                                parts_pick = gr.Dropdown([], value=[], multiselect=True, label="Select checkpoints / folders to delete", scale=6)
+                                parts_del_btn = gr.Button("🗑️ Delete selected", variant="stop", scale=1, min_width=150)
+                        storage_pending = gr.State([])
+                        with gr.Group(visible=False) as confirm_group:
+                            confirm_md = gr.Markdown("")
+                            with gr.Row():
+                                confirm_btn = gr.Button("✅ Yes, delete permanently", variant="stop")
+                                cancel_btn = gr.Button("Cancel", variant="secondary")
+                        result_md = gr.Markdown("", elem_classes="hint")
+
+                        scan_btn.click(lambda k=kind: storage_view(k), None, [tbl, total_md, pick])
+                        if kind == "loras":
+                            scan_btn.click(lambda: gr.update(choices=storage_run_choices()), None, run_pick)
+                            run_pick.change(lambda r: storage_view("parts", r), run_pick, [parts_tbl, parts_md, parts_pick])
+                            mode = gr.State("loras")
+                            del_btn.click(lambda keys: ("loras", *storage_ask(keys, "loras")), pick, [mode, storage_pending, confirm_group, confirm_md])
+                            parts_del_btn.click(lambda keys: ("parts", *storage_ask(keys, "parts")), parts_pick, [mode, storage_pending, confirm_group, confirm_md])
+                            keep_best_btn.click(lambda r: ("parts", *storage_ask_keep_best(r)), run_pick, [mode, storage_pending, confirm_group, confirm_md])
+
+                            def lora_confirm(keys, which, run_key):
+                                done = storage_delete(keys, which, run_key)
+                                runs = storage_view("loras")
+                                parts = storage_view("parts", run_key) if run_key and (ROOT / run_key).exists() else ([], "", gr.update(choices=[], value=[]))
+                                run_update = gr.update(choices=storage_run_choices(), value=run_key if run_key and (ROOT / run_key).exists() else None)
+                                return (*done[:3], *runs, *parts, run_update)
+
+                            confirm_btn.click(
+                                lora_confirm,
+                                [storage_pending, mode, run_pick],
+                                [storage_pending, confirm_group, result_md, tbl, total_md, pick, parts_tbl, parts_md, parts_pick, run_pick],
+                            )
+                        else:
+                            del_btn.click(lambda keys, k=kind: storage_ask(keys, k), pick, [storage_pending, confirm_group, confirm_md])
+                            confirm_btn.click(
+                                lambda keys, k=kind: storage_delete(keys, k),
+                                storage_pending,
+                                [storage_pending, confirm_group, result_md, tbl, total_md, pick],
+                            )
+                        cancel_btn.click(lambda: ([], gr.update(visible=False), "Cancelled: nothing was deleted."), None,
+                                         [storage_pending, confirm_group, result_md], queue=False)
+
+                with gr.Accordion("🎧 Quick checkpoint compare", open=False, elem_classes="accordion"):
+                    gr.Markdown(
+                        "Generate the same text with the same voice and seed on several checkpoints of one LoRA, "
+                        "then listen side by side. Uses the Higgs V3 inference engine.",
+                        elem_classes="hint",
+                    )
+                    with gr.Row(equal_height=True):
+                        cmp_project = gr.Dropdown(lora_projects("v3"), value=None, label="LoRA run", scale=4)
+                        cmp_refresh = gr.Button("🔄", scale=0, min_width=48, variant="secondary")
+                    with gr.Row(equal_height=True):
+                        cmp_checkpoints = gr.Dropdown([], value=[], multiselect=True, label="Checkpoints to compare", scale=6)
+                        cmp_all = gr.Button("☑️ All", scale=0, min_width=80, variant="secondary")
+                    cmp_text = gr.Textbox(
+                        label="Text",
+                        lines=2,
+                        placeholder="A sentence that was NOT in the training data shows best how each checkpoint generalises. Type @ for tags.",
+                        elem_classes=["tag-ac-v3"],
+                    )
+                    with gr.Row(equal_height=True):
+                        cmp_voice = gr.Dropdown(list_voice_names(), value="None", label="Reference voice (optional)", scale=3)
+                        cmp_seed = gr.Number(value=1234, precision=0, label="Seed", scale=1)
+                        cmp_temp = gr.Slider(0.1, 1.5, value=1.0, step=0.05, label="Temperature", scale=2)
+                    cmp_btn = gr.Button("▶️ Generate on each checkpoint", variant="primary")
+                    cmp_status = gr.Markdown("")
+                    cmp_results = gr.HTML(_compare_html([], "", 1234, "None"))
+                    cmp_refresh.click(lambda: gr.update(choices=lora_projects("v3")), None, cmp_project, queue=False)
+                    cmp_project.change(compare_checkpoint_choices, cmp_project, cmp_checkpoints, queue=False)
+                    cmp_all.click(compare_select_all, cmp_project, cmp_checkpoints, queue=False)
+                    cmp_btn.click(
+                        compare_checkpoints,
+                        [cmp_project, cmp_checkpoints, cmp_text, cmp_voice, cmp_seed, cmp_temp],
+                        [cmp_status, cmp_results],
+                    )
 
         with gr.Accordion("🖥️ Console", open=True, elem_classes=["console-accordion"]):
             cmd_console = gr.HTML(value=cmd_mirror_html())
@@ -3520,6 +4460,8 @@ def build_ui():
             queue=False,
         )
         refresh_infer_sample_btn.click(refresh_sample_dropdown, None, infer_sample_select, queue=False)
+        wire_clip_import(infer_import_parts, infer_ref_audio, infer_ref_text)
+        wire_clip_import(prep_import_parts, prep_audio_player, prep_transcription, save_sample_name)
         infer_ref_transcribe_start = infer_transcribe_ref_btn.click(
             lambda: (set_button_busy("Transcribing... check the console"), gr.update(interactive=True), "Transcribing reference audio..."),
             None,
@@ -3575,6 +4517,7 @@ def build_ui():
                 *common_params,
                 infer_save_outputs,
                 infer_chunk_mode,
+                infer_carry_tags,
             ],
             [infer_audio_out, infer_file_out, infer_text, infer_console, infer_gen_btn, infer_stop_btn, infer_progress],
             show_progress="hidden",
@@ -3604,6 +4547,7 @@ def build_ui():
                 *common_params,
                 infer_save_outputs,
                 infer_chunk_mode,
+                infer_carry_tags,
                 dialogue_row_count,
                 *speaker_inputs,
             ],
@@ -3675,6 +4619,19 @@ def build_ui():
                 show_progress="hidden",
             )
 
+        dataset_source_mode.change(
+            on_dataset_mode_change,
+            [dataset_source_mode, dataset_isolate],
+            [raw_source_group, ready_source_group, raw_segment_group, ready_clean_group, dataset_asr_model, dataset_isolate, youtube_source_group],
+            queue=False,
+            show_progress="hidden",
+        )
+        ev_youtube_download = youtube_download_btn.click(download_youtube_ui, [dataset_name_input, youtube_urls], youtube_md)
+        youtube_check_btn.click(describe_youtube_ui, dataset_name_input, youtube_md, queue=False)
+        ready_browse_dir_btn.click(lambda cur: browse_ready_dataset("dir", cur), ready_path, [ready_path, ready_scan_md], queue=False)
+        ready_browse_zip_btn.click(lambda cur: browse_ready_dataset("zip", cur), ready_path, [ready_path, ready_scan_md], queue=False)
+        ready_scan_btn.click(describe_ready_dataset, ready_path, ready_scan_md, queue=False)
+        ready_path.submit(describe_ready_dataset, ready_path, ready_scan_md, queue=False)
         browse_src_folder_btn.click(
             browse_source_folder,
             src_folder,
@@ -3706,6 +4663,15 @@ def build_ui():
                 dataset_segment,
                 dataset_min_sec,
                 dataset_max_sec,
+                dataset_source_mode,
+                ready_path,
+                ready_use_split,
+                ready_vad_trim,
+                ready_min_speech,
+                ready_normalize,
+                dataset_align,
+                dataset_align_drop,
+                youtube_urls,
             ],
             [train_manifest, val_manifest, dataset_log_box, dataset_status_box, prep_btn, stop_prep_btn, output_name, dataset_project_card, dataset_name_input],
         )
@@ -3715,7 +4681,7 @@ def build_ui():
             [dataset_log_box, dataset_status_box, prep_btn, stop_prep_btn],
             queue=True,
             show_progress="hidden",
-            cancels=[ev_prep_build],
+            cancels=[ev_prep_build, ev_youtube_download],
         )
         refresh_train_btn.click(refresh_dataset_manifests, None, [train_manifest, val_manifest], queue=False)
         auto_tune_btn.click(
@@ -3842,6 +4808,15 @@ def build_ui():
                 dataset_segment,
                 dataset_min_sec,
                 dataset_max_sec,
+                dataset_source_mode,
+                ready_path,
+                ready_use_split,
+                ready_vad_trim,
+                ready_min_speech,
+                ready_normalize,
+                dataset_align,
+                dataset_align_drop,
+                youtube_urls,
             ],
             queue=False,
             show_progress="hidden",
@@ -3900,6 +4875,7 @@ def build_ui():
             queue=False,
         )
         resume_checkpoint_choice.change(resume_choice_to_state, resume_checkpoint_choice, resume_checkpoint, queue=False)
+        v3_patience.input(set_live_patience, [v3_patience, output_name], None, queue=False, show_progress="hidden")
         training_start = start_btn.click(
             lambda: (set_button_busy("Starting training... check logs"), "Starting training command..."),
             None,
@@ -3969,7 +4945,7 @@ def build_ui():
             )
         if cmd_console_timer is not None:
             cmd_console_timer.tick(cmd_mirror_html, None, cmd_console, queue=False, show_progress="hidden")
-        demo.load(fn=None, js=APP_JS, queue=False)
+        demo.load(fn=None, js=APP_JS.replace("__TAG_CATALOG__", json.dumps(tag_autocomplete_catalog())), queue=False)
         tb_btn.click(launch_tensorboard, output_name, [logs_box, training_status_box, training_log_box], queue=False)
 
         v3_precision.change(set_v3_runtime, [v3_precision, v3_attention_backend, v3_torch_compile], logs_box, queue=False)

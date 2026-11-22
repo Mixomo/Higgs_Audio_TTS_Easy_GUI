@@ -141,7 +141,14 @@ def monitor_html(project: str | None, running: bool = False) -> str:
     train = [r for r in records if r["type"] == "train"]
     evals = [r for r in records if r["type"] == "eval"]
     warns = [r for r in records if r["type"] == "warn"]
-    stop = next((r for r in reversed(records) if r["type"] == "stop"), None)
+    resumes = [r for r in records if r["type"] == "resume"]
+    # A continued run is one history: only a stop logged after the latest resume ends it.
+    last_resume_at = max((i for i, r in enumerate(records) if r["type"] == "resume"), default=-1)
+    stop = next((r for r in reversed(records[last_resume_at + 1:]) if r["type"] == "stop"), None)
+    earlier_stops = [r for r in records[: last_resume_at + 1] if r["type"] == "stop"]
+    patience_now = next(
+        (r.get("patience") for r in reversed(records[last_resume_at + 1:]) if r["type"] in ("patience", "config")), None
+    )
     total = float(config.get("total_steps") or 0) or max([r["step"] for r in train] + [1])
     base = next((r["eval_loss"] for r in evals if r.get("base")), None)
     run_evals = [r for r in evals if not r.get("base")]
@@ -153,9 +160,12 @@ def monitor_html(project: str | None, running: bool = False) -> str:
         reason = stop.get("reason", "finished")
         label, kind = ("Finished", "ok") if reason == "finished" else ("Stopped early", "warn")
         status_detail = reason if reason != "finished" else f"Final adapter = {stop.get('final', 'last')}"
-    elif last:
+    elif last and (not resumes or last["step"] > resumes[-1]["step"]):
         label, kind = STATUS_STYLE.get(last.get("status"), ("Training", "info"))
-        status_detail = f"patience {last.get('bad_evals', 0)}/{config.get('patience') or '—'}"
+        status_detail = f"patience {last.get('bad_evals', 0)}/{patience_now or '—'}"
+    elif resumes:
+        label, kind = ("Resumed", "info") if running else ("Resumed (not running)", "info")
+        status_detail = f"from step {resumes[-1]['step']} · first eval of this session pending · patience –/{patience_now or '—'}"
     else:
         label, kind, status_detail = "Training", "info", "first eval pending"
     if running and not stop and kind == "ok":
@@ -181,7 +191,10 @@ def monitor_html(project: str | None, running: bool = False) -> str:
         cards.append(card("Train/eval gap", f"{gap:.2f}", f"{gap_best:.2f} at best" if gap_best is not None else "", tone))
     if train:
         t = train[-1]
-        cards.append(card("Progress", f"{t['step']}/{int(total)}", f"epoch {t.get('epoch', 0):.1f} of {config.get('epochs', '?')}"))
+        sub = f"epoch {t.get('epoch', 0):.1f} of {config.get('epochs', '?')}"
+        if resumes:
+            sub += f" · resumed ×{len(resumes)}"
+        cards.append(card("Progress", f"{t['step']}/{int(total)}", sub))
         cards.append(card("LR now", f"{t['lr']:.1e}", config.get("optimizer", "")))
 
     # ---- charts
@@ -192,12 +205,18 @@ def monitor_html(project: str | None, running: bool = False) -> str:
     markers = []
     if best:
         markers.append({"x": best["step"], "color": "#22c55e", "label": f"best {best['eval_loss']:.3f}"})
+    for r in earlier_stops:
+        if r.get("reason") not in (None, "finished") and not any(x["step"] == r["step"] for x in resumes):
+            markers.append({"x": r["step"], "color": "#f97316", "label": "stopped"})
+    for r in resumes:
+        markers.append({"x": r["step"], "color": "#60a5fa", "label": "resumed"})
     if stop and stop.get("reason") not in (None, "finished"):
         markers.append({"x": stop["step"], "color": "#f97316", "label": "early stop"})
     hlines = [{"y": base, "color": "#a1a1aa", "label": f"base model {base:.3f}"}] if base is not None else []
     charts = _chart(loss_series, total, "Loss (lower is better) · eval above train and rising = memorising", markers=markers, hlines=hlines)
+    resume_marks = [{"x": r["step"], "color": "#60a5fa", "label": "resumed"} for r in resumes]
     lr_chart = _chart([{"name": "learning rate", "color": "#f59e0b", "points": [(r["step"], r["lr"]) for r in train]}],
-                      total, "Learning rate", log_y=True, height=170)
+                      total, "Learning rate", log_y=True, height=170, markers=resume_marks)
     gn_chart = _chart([{"name": "grad norm", "color": "#ec4899", "points": [(r["step"], r.get("grad_norm")) for r in train]}],
                       total, "Gradient norm (spikes = instability)", height=170)
 

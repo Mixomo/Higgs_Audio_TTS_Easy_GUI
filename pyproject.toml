@@ -48,6 +48,10 @@ dependencies = [
     "tqdm",
     "transformers>=4.56",
     "vector_quantize_pytorch",
+    "pymss>=2.4 ; python_full_version >= '3.11'",
+    "yt-dlp[default]>=2025.10",
+    "imageio-ffmpeg>=0.5",
+    "deno>=2.1",
 ]
 
 [tool.setuptools.packages.find]
