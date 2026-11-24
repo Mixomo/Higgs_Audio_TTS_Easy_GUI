@@ -52,10 +52,19 @@ dependencies = [
     "yt-dlp[default]>=2025.10",
     "imageio-ffmpeg>=0.5",
     "deno>=2.1",
+    "num2words>=0.5.14",
+    "lavasr",
+    "vocos",
+    "encodec==0.1.1",
 ]
 
 [tool.setuptools.packages.find]
 include = ["boson_multimodal*", "higgs_local*"]
+
+[tool.uv.sources]
+# LavaSR voice enhancer (Apache-2.0) and the Vocos fork it needs (MIT), pinned to tested commits.
+lavasr = { git = "https://github.com/ysharma3501/LavaSR.git", rev = "33ac040892519c1bb4aed7eb32e79af51cc29e2a" }
+vocos = { git = "https://github.com/langtech-bsc/vocos.git", rev = "451e522f7a11c3652c9522f63ea6780736d93de0" }
 
 [tool.uv]
 constraint-dependencies = [

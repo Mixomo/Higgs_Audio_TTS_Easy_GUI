@@ -333,6 +333,20 @@ class ASRManager:
         text, lang_code = self._crisper_transcribe(model, audio_path, language)
         return text, f"{label} transcription complete. Language: {lang_code}"
 
+    def transcribe_words(self, audio_path: str, label: str, language: str = "Auto-detect"):
+        """Verbatim transcript with word timings: (text, [WordTimestamp], language code)."""
+        import soxr
+
+        if label not in WHISPER_MODELS:
+            raise ValueError(f"Word timings need a CrisperWhisper model, not {label}")
+        model = self._load_whisper(label)
+        audio, sr = self._read_audio(audio_path)
+        if sr != 16000:
+            audio = soxr.resample(audio, sr, 16000).astype(np.float32)
+        lang_code = WHISPER_LANGS.get(language) or self._detect_language(model, audio)
+        result = model.transcribe(audio, language=lang_code, sr=16000, mode="verbatim", word_timestamps=True)
+        return clean_verbatim(result.text), list(result.words or []), lang_code
+
     def transcribe_many_whisper(
         self,
         audio_paths: list[str],

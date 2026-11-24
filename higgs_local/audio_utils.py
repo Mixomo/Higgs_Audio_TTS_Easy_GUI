@@ -10,7 +10,7 @@ import soundfile as sf
 
 
 SAMPLE_RATE = 24000
-TARGET_LUFS = -16.0
+TARGET_LUFS = -20.0  # legacy name; the app's loudness lives in higgs_local.loudness
 PEAK_CEIL = 10 ** (-1.0 / 20.0)
 
 
@@ -25,33 +25,25 @@ def timestamped_name(prefix: str, suffix: str = ".wav") -> str:
     return f"{safe_name(prefix, 'higgs')}_{stamp}{suffix}"
 
 
-def normalize_audio(audio: np.ndarray, loudness: bool = True) -> np.ndarray:
+def normalize_audio(audio: np.ndarray, loudness: bool = True, sr: int = SAMPLE_RATE) -> np.ndarray:
+    """Mono, at the app's one loudness (``higgs_local.loudness``; as it is when that is off), peaks under −1 dB."""
     x = np.asarray(audio, dtype=np.float32)
     if x.ndim > 1:
         x = np.mean(x, axis=1 if x.shape[1] <= x.shape[0] else 0)
     if x.size == 0:
         return x
     if loudness:
-        try:
-            import pyloudnorm as pyln
+        from . import loudness as _loudness
 
-            meter = pyln.Meter(SAMPLE_RATE)
-            measured = meter.integrated_loudness(x)
-            if np.isfinite(measured):
-                gain = 10 ** ((TARGET_LUFS - measured) / 20.0)
-                x = x * min(gain, 10.0)
-        except Exception:
-            rms = float(np.sqrt(np.mean(x**2)))
-            if rms > 1e-6:
-                x = x * min((10 ** (-20.0 / 20.0)) / rms, 10.0)
+        x = _loudness.normalize(x, int(sr))
     peak = float(np.max(np.abs(x)))
     if peak > PEAK_CEIL:
         x = x * (PEAK_CEIL / peak)
     return x.astype(np.float32)
 
 
-def dual_mono(audio: np.ndarray) -> np.ndarray:
-    mono = normalize_audio(audio)
+def dual_mono(audio: np.ndarray, sr: int = SAMPLE_RATE, level: bool = True) -> np.ndarray:
+    mono = normalize_audio(audio, level, sr)
     if mono.size == 0:
         return np.zeros((0, 2), dtype=np.float32)
     return np.column_stack([mono, mono]).astype(np.float32)
@@ -77,9 +69,10 @@ def concatenate(chunks: Iterable[np.ndarray], sr: int = SAMPLE_RATE, gap_seconds
     return normalize_audio(np.concatenate(out))
 
 
-def save_wav(path: Path, sr: int, audio: np.ndarray) -> Path:
+def save_wav(path: Path, sr: int, audio: np.ndarray, level: bool = True) -> Path:
+    """``level=False`` keeps the loudness the caller gave (an explicit delivery target)."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    sf.write(str(path), dual_mono(audio), int(sr))
+    sf.write(str(path), dual_mono(audio, int(sr), level), int(sr))
     return path
 
 
@@ -88,12 +81,18 @@ def ensure_dual_mono_file(path: Path) -> bool:
         return False
     try:
         data, sr = sf.read(str(path), dtype="float32", always_2d=False)
-        out = dual_mono(data)
+        out = dual_mono(data, int(sr))
         if data.ndim == 2 and data.shape[1] == 2:
             left = data[:, 0]
             right = data[:, 1]
             if np.allclose(left, right, atol=1e-5) and float(np.max(np.abs(data))) <= PEAK_CEIL + 1e-4:
-                return False
+                from . import loudness as _loudness
+
+                value = _loudness.measure(left, int(sr)) if _loudness.enabled() else None
+                # already at the app's loudness (or held down by the peak ceiling): nothing to do
+                if value is None or abs(value - _loudness.SETTINGS["target"]) < 0.5 or \
+                        float(np.max(np.abs(out))) >= float(np.max(np.abs(data))) - 1e-4:
+                    return False
         sf.write(str(path), out, sr)
         return True
     except Exception:

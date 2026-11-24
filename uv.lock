@@ -847,6 +847,12 @@ wheels = [
 ]
 
 [[package]]
+name = "docopt"
+version = "0.6.2"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/a2/55/8f8cab2afd404cf578136ef2cc5dfb50baa1761b68c9da1fb1e4eed343c9/docopt-0.6.2.tar.gz", hash = "sha256:49b3a825280bd66b3aa83585ef59c4a8c82f2c8a522dbe754a8bc8d08c85c491", size = 25901, upload-time = "2014-06-16T11:18:57.406Z" }
+
+[[package]]
 name = "docstring-parser"
 version = "0.18.0"
 source = { registry = "https://pypi.org/simple" }
@@ -877,6 +883,18 @@ sdist = { url = "https://files.pythonhosted.org/packages/84/96/df2cfa7418b175ddd
 wheels = [
     { url = "https://files.pythonhosted.org/packages/d0/28/6768d342b2b888f9facdddbd430daf015cab936e2598281ab436b1be1b4a/einx-0.4.3-py3-none-any.whl", hash = "sha256:47ce54a0144f6dffcfacdd8fe2cc9e2e5e6485dda2471330ab75ee747dd22f39", size = 163766, upload-time = "2026-04-01T09:50:40.165Z" },
 ]
+
+[[package]]
+name = "encodec"
+version = "0.1.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "einops" },
+    { name = "numpy" },
+    { name = "torch" },
+    { name = "torchaudio" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/62/59/e47bbd0542d0e6f4ce9983d5eb458a01d4b42c81e5c410cb9e159b1061ae/encodec-0.1.1.tar.gz", hash = "sha256:36dde98ccfe6c51a15576476cadfcb3b35a63507b8b8555abd69889a6fba6772", size = 3736037, upload-time = "2022-10-25T16:13:21.471Z" }
 
 [[package]]
 name = "exceptiongroup"
@@ -1241,6 +1259,7 @@ dependencies = [
     { name = "dacite" },
     { name = "deno" },
     { name = "descript-audio-codec" },
+    { name = "encodec" },
     { name = "gradio" },
     { name = "hf-xet" },
     { name = "huggingface-hub" },
@@ -1250,9 +1269,11 @@ dependencies = [
     { name = "jieba" },
     { name = "json-repair" },
     { name = "langid" },
+    { name = "lavasr" },
     { name = "librosa" },
     { name = "llvmlite" },
     { name = "loguru" },
+    { name = "num2words" },
     { name = "numba" },
     { name = "numpy" },
     { name = "omegaconf" },
@@ -1278,6 +1299,7 @@ dependencies = [
     { name = "tqdm" },
     { name = "transformers" },
     { name = "vector-quantize-pytorch" },
+    { name = "vocos" },
     { name = "yt-dlp", version = "2026.10.21", source = { registry = "https://pypi.org/simple" }, extra = ["default"], marker = "python_full_version < '3.11'" },
     { name = "yt-dlp", version = "2026.10.26", source = { registry = "https://pypi.org/simple" }, extra = ["default"], marker = "python_full_version >= '3.11'" },
 ]
@@ -1291,6 +1313,7 @@ requires-dist = [
     { name = "dacite" },
     { name = "deno", specifier = ">=2.1" },
     { name = "descript-audio-codec" },
+    { name = "encodec", specifier = "==0.1.1" },
     { name = "gradio", specifier = ">=4.44" },
     { name = "hf-xet" },
     { name = "huggingface-hub" },
@@ -1300,9 +1323,11 @@ requires-dist = [
     { name = "jieba" },
     { name = "json-repair" },
     { name = "langid" },
+    { name = "lavasr", git = "https://github.com/ysharma3501/LavaSR.git?rev=33ac040892519c1bb4aed7eb32e79af51cc29e2a" },
     { name = "librosa", specifier = "==0.11.0" },
     { name = "llvmlite", specifier = ">=0.44,<0.46" },
     { name = "loguru" },
+    { name = "num2words", specifier = ">=0.5.14" },
     { name = "numba", specifier = ">=0.61,<0.63" },
     { name = "numpy", specifier = ">=1.26,<2.3" },
     { name = "omegaconf" },
@@ -1327,6 +1352,7 @@ requires-dist = [
     { name = "tqdm" },
     { name = "transformers", specifier = ">=4.56" },
     { name = "vector-quantize-pytorch" },
+    { name = "vocos", git = "https://github.com/langtech-bsc/vocos.git?rev=451e522f7a11c3652c9522f63ea6780736d93de0" },
     { name = "yt-dlp", extras = ["default"], specifier = ">=2025.10" },
 ]
 
@@ -1711,6 +1737,17 @@ dependencies = [
     { name = "numpy" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/ea/4c/0fb7d900d3b0b9c8703be316fbddffecdab23c64e1b46c7a83561d78bd43/langid-1.1.6.tar.gz", hash = "sha256:044bcae1912dab85c33d8e98f2811b8f4ff1213e5e9a9e9510137b84da2cb293", size = 1925978, upload-time = "2016-04-05T22:34:15.786Z" }
+
+[[package]]
+name = "lavasr"
+version = "0.0.2"
+source = { git = "https://github.com/ysharma3501/LavaSR.git?rev=33ac040892519c1bb4aed7eb32e79af51cc29e2a#33ac040892519c1bb4aed7eb32e79af51cc29e2a" }
+dependencies = [
+    { name = "librosa" },
+    { name = "soundfile" },
+    { name = "torch" },
+    { name = "vocos" },
+]
 
 [[package]]
 name = "lazy-loader"
@@ -2264,6 +2301,18 @@ resolution-markers = [
 sdist = { url = "https://files.pythonhosted.org/packages/6a/51/63fe664f3908c97be9d2e4f1158eb633317598cfa6e1fc14af5383f17512/networkx-3.6.1.tar.gz", hash = "sha256:26b7c357accc0c8cde558ad486283728b65b6a95d85ee1cd66bafab4c8168509", size = 2517025, upload-time = "2025-12-08T17:02:39.908Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/9e/c9/b2622292ea83fbb4ec318f5b9ab867d0a28ab43c5717bb85b0a5f6b3b0a4/networkx-3.6.1-py3-none-any.whl", hash = "sha256:d47fbf302e7d9cbbb9e2555a0d267983d2aa476bac30e90dfbe5669bd57f3762", size = 2068504, upload-time = "2025-12-08T17:02:38.159Z" },
+]
+
+[[package]]
+name = "num2words"
+version = "0.5.14"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "docopt" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/f6/58/ad645bd38b4b648eb2fc2ba1b909398e54eb0cbb6a7dbd2b4953e38c9621/num2words-0.5.14.tar.gz", hash = "sha256:b066ec18e56b6616a3b38086b5747daafbaa8868b226a36127e0451c0cf379c6", size = 218213, upload-time = "2024-12-17T20:17:10.191Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d6/5b/545e9267a1cc080c8a1be2746113a063e34bcdd0f5173fd665a5c13cb234/num2words-0.5.14-py3-none-any.whl", hash = "sha256:1c8e5b00142fc2966fd8d685001e36c4a9911e070d1b120e1beb721fa1edb33d", size = 163525, upload-time = "2024-12-17T20:17:06.074Z" },
 ]
 
 [[package]]
@@ -4458,6 +4507,23 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/ea/1d/ae01aa6e1a80627a1268bac6993242dfe758b85d519bfb1106eefecfc6da/vector_quantize_pytorch-1.29.1.tar.gz", hash = "sha256:e7a9710a6c68ac633b2b5906a4091cd7bd38c6762ccdb6bef04f1fd71d53f661", size = 51632, upload-time = "2026-05-16T23:17:08.643Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/1f/9d/d5cfb0cff3640f7aefe721f08f69957d77b152cc6d24bb0c575c1528c6dd/vector_quantize_pytorch-1.29.1-py3-none-any.whl", hash = "sha256:bfc0373adf2f230ca96af712933dadd7010857fad4697c8ad84cde1a0752d611", size = 57501, upload-time = "2026-05-16T23:17:06.688Z" },
+]
+
+[[package]]
+name = "vocos"
+version = "0.1.0"
+source = { git = "https://github.com/langtech-bsc/vocos.git?rev=matcha#451e522f7a11c3652c9522f63ea6780736d93de0" }
+dependencies = [
+    { name = "einops" },
+    { name = "encodec" },
+    { name = "huggingface-hub" },
+    { name = "numpy" },
+    { name = "pyyaml" },
+    { name = "scipy", version = "1.15.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.11.*'" },
+    { name = "scipy", version = "1.18.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+    { name = "torch" },
+    { name = "torchaudio" },
 ]
 
 [[package]]

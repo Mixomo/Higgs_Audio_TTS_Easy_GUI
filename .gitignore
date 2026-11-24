@@ -15,6 +15,7 @@ models/
 projects/
 config/*.json
 torch_backend.txt
+config/gui_presets/prueba.json
 
 # Local quarantine / manual cleanup markers
 *.delete
@@ -75,3 +76,6 @@ Thumbs.db
 demo_resources
 demo_gui.py
 start-demo.bat
+
+# Downloaded engines (llama.cpp and its CUDA runtime)
+tools/

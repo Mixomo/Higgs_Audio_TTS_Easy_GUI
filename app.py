@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import numpy as np
 import atexit
 import gc
 import logging
@@ -134,6 +135,22 @@ from higgs_local.adapters import (
 from higgs_local.asr import ASRManager, WHISPER_LANGS
 from higgs_local.dataset_audio import CLEAN_ENGINES
 from higgs_local.engines import ModelManager, text_chunks_for_ui
+from higgs_local import takecheck as tc
+from higgs_local import fixer as fx
+from higgs_local import llm, loudness, montage
+from higgs_local.block_editors import DIALOGUE_EDITOR_CSS, DIALOGUE_EDITOR_HTML, DIALOGUE_EDITOR_JS
+from higgs_local.live import LIVE_PLAYER_CSS, LIVE_PLAYER_HTML, LIVE_PLAYER_JS, live_poll
+from higgs_local.render import (
+    LOUDNESS_TARGETS,
+    READ_AS_WORDS,
+    Advanced,
+    Block,
+    Cancelled,
+    Renderer,
+    Sampling,
+    clear_take_cache,
+    results_report,
+)
 from higgs_local.model_registry import (
     DEFAULT_ASR_MODEL,
     ASR_MODELS,
@@ -141,12 +158,13 @@ from higgs_local.model_registry import (
     PROCESSOR_MODELS,
     TOKENIZER_MODELS,
     TTS_MODELS,
+    WHISPER_MODELS,
     ensure_tts_model,
     ensure_asr_model,
     ensure_model,
     model_status,
 )
-from higgs_local.paths import OUTPUTS_DIR, ROOT, SAMPLES_DIR, TEMP_DIR, V2_DEFAULT_MODEL, V2_DEFAULT_TOKENIZER, ensure_local_dirs
+from higgs_local.paths import CACHE_DIR, OUTPUTS_DIR, ROOT, SAMPLES_DIR, TEMP_DIR, V2_DEFAULT_MODEL, V2_DEFAULT_TOKENIZER, ensure_local_dirs
 from higgs_local.training_utils import (
     DEFAULT_TRAINING_24GB,
     analyze_training_dataset,
@@ -175,7 +193,6 @@ TRAINING_MODEL_CHOICES = [
 ]
 SEAMLESS_MODE = "Seamless (auto)"
 CHUNK_CHOICES = [SEAMLESS_MODE, "None", "Paragraph/Sentence Auto", "Periods", "Paragraphs", "Lines", "Speaker turns"]
-DIALOGUE_MAX_SEGMENTS = 20
 WHISPER_VRAM = {
     "CrisperWhisper 2.0 large": "best · ~5 GB VRAM",
     "CrisperWhisper 2.0 turbo": "fast · ~2.5 GB VRAM",
@@ -204,8 +221,50 @@ APP_JS = """
   setInterval(tick, 500);
   tick();
 
+  // ---------------- modals: ✕, a click outside the card and Esc press the modal's Cancel button
+  const modalCancel = (m) => m.querySelector('button.hv-cancel, .hv-cancel button');
+  const shownModals = () => [...document.querySelectorAll('.hv-modal:not(.hv-js)')].filter((m) => m.getClientRects().length);
+  document.addEventListener('click', (e) => {
+    const m = e.target.closest && e.target.closest('.hv-modal'); if (!m || m.classList.contains('hv-js')) return;
+    if (e.target === m || e.target.closest('.hv-x')) { const c = modalCancel(m); if (c) c.click(); }
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape' || e.defaultPrevented) return;
+    const m = shownModals().pop(); if (!m) return;
+    const c = modalCancel(m); if (c) { e.preventDefault(); c.click(); }
+  });
+  // a modal that opens takes the focus (Enter = its main button)
+  new MutationObserver(() => {
+    for (const m of shownModals()) {
+      if (m.dataset.hvOpen) continue;
+      m.dataset.hvOpen = '1';
+      // Enter = the main button, but never a destructive one (those start on Cancel)
+      const main = m.querySelector('.hv-actions button:last-child');
+      const pick = main && main.classList.contains('stop') ? modalCancel(m) : main;
+      if (pick) setTimeout(() => pick.focus(), 60);
+    }
+    document.querySelectorAll('.hv-modal[data-hv-open]').forEach((m) => { if (!m.getClientRects().length) delete m.dataset.hvOpen; });
+  }).observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['class', 'style'] });
+
   // ---------------- @ tag autocomplete (Inference script, dialogue lines, eval / compare texts)
   const CATALOG = __TAG_CATALOG__;
+  window.__hvSepEngines = __SEP_ENGINES__;
+  // library voices and LoRAs, asked from the server (they change while the app runs)
+  const dyn = { t: 0, model: '', items: [] };
+  const refreshDyn = async (ta, model) => {
+    if (!window.__hvTagOptions || (Date.now() - dyn.t < 5000 && dyn.model === model)) return;
+    dyn.t = Date.now(); dyn.model = model;
+    try {
+      const r = await window.__hvTagOptions(model);
+      dyn.items = [
+        ...(r.voices || []).map((v) => ({ cat: 'Voice from here on (library)', label: `{voice:${v}}`, hint: 'speaker', insert: `{voice:${v}} ` })),
+        ...(r.loras || []).map((l) => ({ cat: 'LoRA from here on', label: `{lora:${l}}`, hint: 'final adapter', insert: `{lora:${l}} ` })),
+        { cat: 'LoRA from here on', label: '{lora:none}', hint: 'base model', insert: '{lora:none} ' },
+        ...[250, 500, 800, 1200, 2000].map((ms) => ({ cat: 'Pause before what follows', label: `{pause:${ms}}`, hint: `${ms} ms`, insert: `{pause:${ms}} ` })),
+      ];
+      if (st && st.ta === ta) update(ta);
+    } catch (e) { /* the server is busy: try again on the next key */ dyn.t = 0; }
+  };
   const modelFor = (ta) => {
     if (ta.closest('.tag-ac-v3')) return 'Higgs V3 TTS';
     const sel = document.querySelector('#infer-model-select input');
@@ -268,8 +327,9 @@ APP_JS = """
     if (at < 0 || ta.selectionEnd !== pos) return close();
     const q = before.slice(at + 1);
     if (/\\s/.test(q) || q.length > 40) return close();
-    const list = CATALOG[modelFor(ta)] || [];
-    const words = q.toLowerCase().split(/[:|_<>\\[\\]-]+/).filter(Boolean);
+    refreshDyn(ta, modelFor(ta));
+    const list = [...dyn.items, ...(CATALOG[modelFor(ta)] || [])];
+    const words = q.toLowerCase().split(/[:|_<>{}\\[\\]-]+/).filter(Boolean);
     const items = list.filter((it) => {
       const hay = (it.cat + ' ' + it.label).toLowerCase();
       return words.every((w) => hay.includes(w));
@@ -498,6 +558,14 @@ def _save_ui_settings(**updates) -> None:
     SETTINGS_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
+def _init_loudness() -> None:
+    s = _load_ui_settings()
+    loudness.configure(s.get("loudness_on", True), s.get("loudness_target", -20.0))
+
+
+_init_loudness()
+
+
 def v3_compile_default() -> bool:
     return bool(_load_ui_settings().get("v3_torch_compile", False))
 
@@ -545,10 +613,20 @@ def _clean_tmp_dir() -> None:
 
 
 atexit.register(_clean_tmp_dir)
+atexit.register(lambda: llm.SERVER.stop())  # the local LLM server never outlives the app
 
 
-def _save_output(prefix: str, sr: int, wav, text: str = "", reference_name: str = "", persist: bool = True) -> str:
+def _save_output(prefix: str, sr: int, wav, text: str = "", reference_name: str = "", persist: bool = True, adv=None) -> str:
+    if adv is not None and getattr(adv, "enhance", False):
+        from higgs_local.enhance import ENHANCER
+
+        t0 = time.perf_counter()
+        wav, sr = ENHANCER.enhance(wav, sr, denoise=bool(getattr(adv, "enhance_denoise", False)))
+        print(f"[enhance] LavaSR: highs restored, {sr} Hz, in {time.perf_counter() - t0:.1f} s", flush=True)
+        if not getattr(adv, "keep_check_models", True):
+            ENHANCER.unload()
     root = OUTPUTS_DIR if persist else TEMP_DIR / "generated"
+    text = VOICE_TAG_RE.sub(" ", text or "")
     match = re.search(r".*?(?:\(\.\.\.\)|\.\.\.|[.!?…])", (text or "").strip(), flags=re.S)
     excerpt = (match.group(0) if match else (text or "").strip())[:110]
     parts = [
@@ -558,7 +636,13 @@ def _save_output(prefix: str, sr: int, wav, text: str = "", reference_name: str 
     ]
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     path = root / f"{'_'.join(parts)}_{stamp}.wav"
-    save_wav(path, sr, wav)
+    # the same loudness for every output (after enhancing, which adds highs), unless a delivery target was asked
+    explicit = adv is not None and LOUDNESS_TARGETS.get(getattr(adv, "final_loudness", None))
+    if explicit:
+        from higgs_local.render import final_loudness as _final_loudness
+
+        wav = _final_loudness(np.asarray(wav, dtype=np.float32), sr, adv.final_loudness)
+    save_wav(path, sr, wav, level=not explicit)
     return str(path)
 
 
@@ -634,7 +718,7 @@ def storage_ask(keys, kind):
         "parts": "Deleted checkpoints can no longer be used for inference or to resume training.",
     }[kind]
     text = (
-        f"### ⚠️ Delete {len(keys)} item(s), {storage.human(total)}?\n{warning} **This cannot be undone.**\n\n"
+        f"**{len(keys)} item(s), {storage.human(total)}.** {warning} **This cannot be undone.**\n\n"
         + "\n".join(lines[:25]) + ("\n- …" if len(lines) > 25 else "")
     )
     return keys, gr.update(visible=True), text
@@ -977,14 +1061,6 @@ def restore_random_seed():
     return gr.update(value=-1), "Seed restored to random mode (-1)."
 
 
-def _dialogue_rows_from_values(values):
-    rows = []
-    for idx in range(0, len(values), 4):
-        text, speaker, audio, ref_text = values[idx : idx + 4]
-        rows.append({"text": text, "speaker": speaker, "audio": audio, "ref_text": ref_text})
-    return rows
-
-
 def _finish_sentence(text: str) -> str:
     text = (text or "").strip()
     if text and not text.endswith((".", "!", "?", ",", ";", ":", '"', "'", "</SE_e>", "</SE>", ">")):
@@ -992,70 +1068,53 @@ def _finish_sentence(text: str) -> str:
     return text
 
 
-def _dialogue_updates(rows, count, note):
-    rows = rows[:DIALOGUE_MAX_SEGMENTS]
-    while len(rows) < DIALOGUE_MAX_SEGMENTS:
-        rows.append({"text": "", "speaker": "None", "audio": None, "ref_text": ""})
-    count = max(1, min(int(count), DIALOGUE_MAX_SEGMENTS))
-    updates = [gr.update(value=row["text"]) for row in rows]
-    updates += [gr.update(value=row["speaker"]) for row in rows]
-    updates += [gr.update(value=row["audio"]) for row in rows]
-    updates += [gr.update(value=row["ref_text"]) for row in rows]
-    updates += [gr.update(visible=i < count) for i in range(DIALOGUE_MAX_SEGMENTS)]
-    return [count, *updates, note]
+# ---------------------------------------------------------------- dialogue builder (any number of lines)
+def _new_row_id() -> str:
+    import uuid
+
+    return uuid.uuid4().hex[:8]
 
 
-def add_dialogue_row(index, count, *values):
-    rows = _dialogue_rows_from_values(values)
-    idx = int(index)
-    count = int(count)
-    if count < DIALOGUE_MAX_SEGMENTS:
-        rows.insert(idx + 1, {"text": "", "speaker": rows[idx]["speaker"], "audio": rows[idx]["audio"], "ref_text": rows[idx]["ref_text"]})
-        count += 1
-    return _dialogue_updates(rows, count, f"Added dialogue row after {idx + 1}.")
+def dialogue_row(text="", voice="None", lora="__inherit__", audio="", ref_text="") -> dict:
+    from higgs_local.montage import file_url
+
+    audio = audio if audio and Path(str(audio)).is_file() else ""
+    return {"id": _new_row_id(), "text": text or "", "voice": voice or "None", "lora": lora or "__inherit__",
+            "audio": audio, "audio_url": file_url(audio) if audio else "", "audio_name": Path(audio).name if audio else "",
+            "ref_text": ref_text or ""}
 
 
-def copy_dialogue_row(index, count, *values):
-    rows = _dialogue_rows_from_values(values)
-    idx = int(index)
-    count = int(count)
-    if count < DIALOGUE_MAX_SEGMENTS:
-        rows.insert(idx + 1, rows[idx].copy())
-        count += 1
-    return _dialogue_updates(rows, count, f"Copied dialogue row {idx + 1}.")
+def _dialogue_data(value) -> dict:
+    try:
+        data = json.loads(value) if isinstance(value, str) else (value or {})
+    except json.JSONDecodeError:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    data.setdefault("rows", [])
+    return data
 
 
-def delete_dialogue_row(index, count, *values):
-    rows = _dialogue_rows_from_values(values)
-    idx = int(index)
-    count = int(count)
-    if count > 1:
-        rows.pop(idx)
-        rows.append({"text": "", "speaker": "None", "audio": None, "ref_text": ""})
-        count -= 1
-    return _dialogue_updates(rows, count, f"Deleted dialogue row {idx + 1}.")
+def dialogue_rows_of(value) -> list[dict]:
+    return [r for r in _dialogue_data(value)["rows"] if isinstance(r, dict)]
 
 
-def reset_dialogue_rows(default_speaker):
-    rows = [
-        {"text": "", "speaker": default_speaker or "None", "audio": None, "ref_text": ""},
-        {"text": "", "speaker": default_speaker or "None", "audio": None, "ref_text": ""},
-    ]
-    return _dialogue_updates(rows, 2, "Dialogue rows reset to default.")
+def dialogue_value(value=None, rows: list[dict] | None = None, model_version: str | None = "Higgs V3 TTS",
+                   default_voice: str | None = None) -> str:
+    """The editor's JSON with fresh voice and LoRA lists (rows kept unless given)."""
+    data = _dialogue_data(value)
+    if rows is not None:
+        data["rows"] = rows
+    data["voices"] = list_voice_names()
+    data["loras"] = [[label, val] for label, val in dialogue_lora_choices(model_version)]
+    if default_voice is not None:
+        data["default_voice"] = default_voice
+    data["rev"] = int(data.get("rev", 0)) + 1
+    return json.dumps(data, ensure_ascii=False)
 
 
-def clear_dialogue_rows(count, *values):
-    rows = _dialogue_rows_from_values(values)
-    for row in rows[: int(count)]:
-        row["text"] = ""
-    return _dialogue_updates(rows, count, "Dialogue row text cleared.")
-
-
-def remove_empty_dialogue_rows(count, *values):
-    rows = [row for row in _dialogue_rows_from_values(values) if (row.get("text") or "").strip()]
-    if not rows:
-        rows = [{"text": "", "speaker": "None", "audio": None, "ref_text": ""}]
-    return _dialogue_updates(rows, len(rows), f"Removed empty rows. Active rows: {len(rows) if (rows[0].get('text') or '').strip() else 0}.")
+def dialogue_sync(value, model_version):
+    return dialogue_value(value, None, model_version)
 
 
 def _progress_adapter(progress, start: float, end: float):
@@ -1093,6 +1152,250 @@ def ensure_asr_for_flow(asr_model: str, progress=None) -> str:
     return f"{asr_model} ready."
 
 
+#                      ---- advanced settings shared by every tab (order of ADV_KEYS = order of the UI inputs)
+ADV_KEYS = [
+    "asr_check", "asr_model", "language", "similarity", "similarity_min", "strictness", "takes", "retries",
+    "sound_checks", "pause_same_ms", "pause_other_ms", "tidy_pauses", "level_pieces", "room_tone",
+    "final_loudness", "words", "live", "keep_check_models", "enhance", "enhance_denoise",
+]
+
+
+def advanced_from_values(values) -> Advanced:
+    data = dict(zip(ADV_KEYS, values))
+    data["strictness"] = str(data.get("strictness") or "Normal")
+    data["takes"] = max(1, int(data.get("takes") or 1))
+    data["retries"] = max(0, int(data.get("retries") or 0))
+    data["pause_same_ms"] = int(data.get("pause_same_ms") or 0)
+    data["pause_other_ms"] = int(data.get("pause_other_ms") or 0)
+    data["sound_checks"] = list(data.get("sound_checks") or [])
+    data["words"] = list(data.get("words") or [])
+    AUTOPLAY["on"] = not bool(data.get("live"))
+    return Advanced(**data)
+
+
+def plain_advanced() -> Advanced:
+    """No checks, no cache, no live playback: what the checkpoint compare uses."""
+    return Advanced(sound_checks=[], live=False, only_changed=False)
+
+
+def _segmenter(gap_seconds: float = 0.5):
+    def segment(text, chunk_mode, carry_tags):
+        return build_segments(text, chunk_mode, float(gap_seconds), carry_tags=bool(carry_tags))
+
+    return segment
+
+
+def _render_progress(state: dict, started: float):
+    now = time.perf_counter()
+    elapsed = now - started
+    title = state.get("title") or "Preparing"
+    if state.get("phase") and state["phase"] != title:
+        title = f"{title} · {state['phase']}"
+    frames = int(state.get("frames", 0))
+    total = max(int(state.get("total", 1)), 1)
+    idx = int(state.get("index", 0))
+    seg_elapsed = max(now - state.get("block_start", now), 1e-3)
+    fps = frames / seg_elapsed if frames else 0.0
+    est = max(50, int(state.get("block_chars", 50) * 1.8))
+    block_frac = min(frames / max(est, frames + 1), 0.99) if frames else 0.0
+    pct = 100.0 * (max(idx - 1, 0) + block_frac) / total if idx else None
+    detail = f"Elapsed {_fmt_clock(elapsed)}"
+    if frames:
+        detail = f"{frames} frames · {fps:.0f} fps ({fps / 25.0:.2f}x realtime) · " + detail
+    if state.get("last_take"):
+        detail += f" · last take: {state['last_take']}"
+    return progress_bar_html(None if pct is None else min(pct, 99.0), title, detail)
+
+
+def render_job(blocks, sampling: Sampling, adv: Advanced, gap_seconds: float, label: str, renderer_box: list | None = None):
+    """Generator: renders ``blocks`` on a worker thread.
+
+    Yields ``("progress", html)`` while it works and finally ``("done", wav, results, elapsed)``.
+    """
+    from higgs_local.win_scheduling import configure_current_thread
+
+    started = time.perf_counter()
+    expanded, problems = expand_voice_tags(list(blocks), sampling.model_version)
+    blocks[:] = expanded  # the caller's list too: its results line up with these blocks
+    if problems:
+        gr.Warning(f"Not found, the line keeps its own voice: {', '.join(problems)}")
+        print(f"[tags] not found: {', '.join(problems)}", flush=True)
+    state: dict = {"title": "Loading model, codec and LoRA", "total": len(blocks)}
+
+    def events(ev):
+        kind = ev.get("type")
+        if kind == "block":
+            state.update(title=f"Block {ev['index']}/{ev['total']}" + (" · reused" if ev.get("cached") else ""),
+                         index=ev["index"], frames=0, block_start=time.perf_counter(),
+                         block_chars=len(ev.get("text", "")), phase="Generating")
+        elif kind == "frames":
+            state["frames"] = ev["frames"]
+        elif kind == "phase":
+            state["phase"] = ev["phase"]
+            state["frames"] = 0
+            state["block_start"] = time.perf_counter()
+        elif kind == "take":
+            state["last_take"] = ev["report"]
+
+    asr = ASR if (adv.asr_check or adv.sound_checks) else None
+    renderer = Renderer(MANAGER, sampling, adv, _segmenter(gap_seconds), asr=asr, events=events)
+    if renderer_box is not None:
+        renderer_box.append(renderer)
+    result: dict = {}
+
+    def target():
+        configure_current_thread()
+        try:
+            result["value"] = renderer.render(blocks, live_label=label)
+        except BaseException as exc:
+            result["error"] = exc
+
+    worker = threading.Thread(target=target, name="higgs-render", daemon=True)
+    worker.start()
+    try:
+        while worker.is_alive():
+            worker.join(0.3)
+            yield ("progress", _render_progress(state, started))
+    finally:
+        if worker.is_alive():  # the UI cancelled: stop the GPU loop too
+            renderer.cancel()
+            worker.join(timeout=30)
+        if not adv.keep_check_models:
+            tc.EMBEDDER.unload()
+    if "error" in result:
+        raise result["error"]
+    wav, results = result["value"]
+    yield ("done", wav, results, time.perf_counter() - started)
+
+
+VOICE_TAG_RE = re.compile(r"\{\s*(voice|lora|pause)\s*:\s*([^{}]*?)\s*\}", re.IGNORECASE)
+NO_VOICE_WORDS = {"", "none", "off", "base", "default"}
+TRAILING_TAGS_RE = re.compile(r"(?:\s*(?:<\|[^|>]*\|>|\[[^\]]*\]|</?SE[^>]*>))+\s*$")
+
+
+def voice_tag_options(*args):
+    """Server function for the @ autocomplete: the library voices and the LoRA projects of the model."""
+    from higgs_local.live import _server_args
+
+    (model,) = _server_args(args, 1)
+    kind = _lora_kind(model or "Higgs V3 TTS")
+    return {"voices": [v for v in list_voice_names() if v != "None"],
+            "loras": [p for p in lora_projects(kind) if p and p != NONE_ADAPTER]}
+
+
+def _lora_from_tag(name: str, model_version: str | None):
+    """A LoRA named in a tag: a project (its final adapter), a checkpoint label or value; None when unknown."""
+    n = (name or "").strip().lower()
+    if n in NO_VOICE_WORDS:
+        return NONE_ADAPTER
+    kind = _lora_kind(model_version)
+    for project in lora_projects(kind):
+        if str(project).lower() == n:
+            checkpoints = lora_checkpoints(kind, project)
+            return checkpoints[0][1] if checkpoints else None
+    for label, val in dialogue_lora_choices(model_version):
+        if n in (str(label).lower(), str(val).lower()) and val != DIALOGUE_INHERIT:
+            return val
+    return None
+
+
+def pause_seconds(value) -> float | None:
+    """``800``, ``800ms``, ``1.5s`` → seconds (0–30); None when it is not a duration."""
+    s = str(value if value is not None else "").strip().lower().replace(",", ".")
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)\s*(ms|s)?", s)
+    if not m:
+        return None
+    n = float(m.group(1))
+    return max(0.0, min(30.0, n if m.group(2) == "s" else n / 1000.0))
+
+
+def split_voice_runs(text: str) -> list[tuple[str, str | None, str | None, float | None]]:
+    """``(text, voice, lora, pause)`` runs of a text with ``{voice:name}``, ``{lora:name}`` and ``{pause:ms}`` tags.
+
+    A voice or LoRA tag holds from where it stands to the end of the text (or the next tag); None = the block's
+    own. A pause tag is the silence before the words that follow it (None = the usual pause). Expression tags
+    written just before a tag go with the words after it."""
+    runs: list[tuple[str, str | None, str | None, float | None]] = []
+    voice = lora = pause = None
+    pos = 0
+    carry = ""
+    for m in VOICE_TAG_RE.finditer(text or ""):
+        chunk = carry + text[pos:m.start()]
+        if tc.visible(chunk).strip():
+            trailing = TRAILING_TAGS_RE.search(chunk)  # expression tags written before the tag go with its words
+            carry = trailing.group(0) if trailing else ""
+            runs.append((chunk[: len(chunk) - len(carry)], voice, lora, pause))
+            pause = None
+        else:
+            carry = chunk
+        kind = m.group(1).lower()
+        if kind == "voice":
+            voice = m.group(2)
+        elif kind == "lora":
+            lora = m.group(2)
+        else:
+            secs = pause_seconds(m.group(2))
+            pause = secs if secs is not None else pause
+        pos = m.end()
+    tail = carry + (text or "")[pos:]
+    if tail.strip() or not runs:
+        runs.append((tail, voice, lora, pause))
+    return runs
+
+
+def _tagged_block(base: Block, text: str, voice, lora, model_version, problems: list[str]) -> Block:
+    b = Block(**{**base.__dict__, "text": text})
+    if voice is not None:
+        names = {v.lower(): v for v in list_voice_names() if v != "None"}
+        if voice.strip().lower() in NO_VOICE_WORDS:
+            b.ref_audio, b.ref_text, b.voice, b.speaker = None, "", "", "Model voice"
+        elif voice.strip().lower() in names:
+            name = names[voice.strip().lower()]
+            audio, ref_text = _resolve_reference(None, name)
+            b.ref_audio, b.ref_text, b.voice, b.speaker = audio or None, ref_text or "", name, name
+        else:
+            problems.append(f"voice “{voice}”")
+    if lora is not None:
+        value = _lora_from_tag(lora, model_version)
+        if value is None:
+            problems.append(f"LoRA “{lora}”")
+        else:
+            b.lora = value
+            if voice is None or voice.strip().lower() in NO_VOICE_WORDS:
+                b.speaker = adapter_project(value) if value != NONE_ADAPTER else (b.speaker or "Model voice")
+    return b
+
+
+def expand_voice_tags(blocks: list, model_version: str | None) -> tuple[list, list[str]]:
+    """Split every block whose text switches voice or LoRA with a tag into one block per voice."""
+    out: list = []
+    problems: list[str] = []
+    for block in blocks:
+        if not VOICE_TAG_RE.search(block.text or ""):
+            out.append(block)
+            continue
+        for k, (text, voice, lora, pause) in enumerate(split_voice_runs(block.text)):
+            b = _tagged_block(block, text.strip(), voice, lora, model_version, problems)
+            if pause is not None:
+                b.pause = pause
+            elif k:
+                b.pause = None
+            out.append(b)
+    return out, sorted(set(problems))
+
+
+def blocks_payload(results, wav_path: str, source: str, blocks: list | None = None) -> list[dict]:
+    """What a finished render hands to the montage timeline: one clip per block, with what made it."""
+    out = []
+    for r in results:
+        b = blocks[r.index - 1] if blocks and 0 < r.index <= len(blocks) else None
+        out.append({"file": r.file, "text": r.text, "speaker": r.speaker, "start": round(r.start, 3),
+                    "seconds": round(r.seconds, 3), "source": source,
+                    "voice": getattr(b, "voice", "") or "", "lora": getattr(b, "lora", "") or "",
+                    "ref_audio": getattr(b, "ref_audio", "") or "", "ref_text": getattr(b, "ref_text", "") or ""})
+    return out or [{"file": wav_path, "text": "", "speaker": "", "start": 0.0, "seconds": 0.0, "source": source}]
+
+
 def run_inference(
     text,
     model_version,
@@ -1112,10 +1415,13 @@ def run_inference(
     chunk_mode,
     carry_tags=True,
     gap_seconds=0.5,
-    progress=gr.Progress(track_tqdm=False),
+    adv: Advanced | None = None,
 ):
-    def out(audio=None, file=None, console=None, busy=True, bar=None):
-        """One UI update for the 7 inference outputs."""
+    adv = adv or plain_advanced()
+    started = time.perf_counter()
+
+    def out(audio=None, file=None, console=None, busy=True, bar=None, blocks=None):
+        """One UI update for the 8 inference outputs."""
         return (
             gr.update() if audio is None else audio,
             gr.update() if file is None else file,
@@ -1124,463 +1430,206 @@ def run_inference(
             set_button_busy("Generating…") if busy else restore_button("⚡ Generate Speech"),
             gr.update(interactive=busy),
             gr.update() if bar is None else bar,
+            gr.update() if blocks is None else blocks,
         )
 
-    started = time.perf_counter()
-    state = {
-        "phase": "Preparing",
-        "label": "",
-        "seg_idx": 1,
-        "seg_total": 1,
-        "seg_est": 50,
-        "seg_start": started,
-        "frames": 0,
-        "done_est": 0,
-        "total_est": 1,
-    }
-
-    def bar(final: str | None = None, kind: str = "run"):
-        now = time.perf_counter()
-        elapsed = now - started
-        if final is not None:
-            return progress_bar_html(100 if kind == "done" else 0, final, f"Elapsed {_fmt_clock(elapsed)}", kind=kind)
-        if state["phase"] != "Generating":
-            return progress_bar_html(None, state["phase"], f"Elapsed {_fmt_clock(elapsed)}")
-        frames = int(state["frames"])
-        seg_elapsed = max(now - state["seg_start"], 1e-3)
-        fps = frames / seg_elapsed
-        seg_frac = min(frames / max(state["seg_est"], frames + 1), 0.99)
-        done = state["done_est"] + seg_frac * state["seg_est"]
-        pct = 100.0 * done / max(state["total_est"], 1)
-        remaining = max(state["total_est"] - done, 0)
-        eta = remaining / fps if fps > 1 else None
-        title = "Generating" + (f" · segment {state['seg_idx']}/{state['seg_total']}" if state["seg_total"] > 1 else "")
-        detail = (
-            f"{frames} frames · {fps:.0f} fps ({fps / 25.0:.2f}x realtime) · ~{frames / 25.0:.1f}s audio"
-            f" · elapsed {_fmt_clock(elapsed)}" + (f" · ETA {_fmt_clock(eta)}" if eta is not None else "")
-        )
-        return progress_bar_html(min(pct, 99.0), title, detail)
-
-    def start_segment(idx: int, total: int, seg_text: str):
-        if idx > 1:
-            state["done_est"] += state["seg_est"]
-        state.update(
-            phase="Generating",
-            seg_idx=int(idx),
-            seg_total=int(total),
-            seg_est=max(50, int(len(seg_text or "") * 1.8)),
-            seg_start=time.perf_counter(),
-            frames=0,
-        )
-
-    def frame_progress(frame, total, desc):
-        state["frames"] = int(frame)
-        if int(frame) % 64 < 16:
-            print(f"[ui-progress] {desc}", flush=True)
-
-    def run_job(job):
-        """Run ``job`` on a worker thread and refresh the bar while it works."""
-        from higgs_local.win_scheduling import configure_current_thread
-
-        result: dict = {}
-
-        def target():
-            configure_current_thread()
-            try:
-                result["value"] = job()
-            except BaseException as exc:  # re-raised in the UI thread
-                result["error"] = exc
-
-        worker = threading.Thread(target=target, name="higgs-tts-job", daemon=True)
-        worker.start()
-        try:
-            while worker.is_alive():
-                worker.join(0.3)
-                yield out(bar=bar())
-        finally:
-            if worker.is_alive():  # UI cancelled: stop the GPU loop too
-                MANAGER.v3.cancel()
-                worker.join(timeout=30)
-        if "error" in result:
-            raise result["error"]
-        job_result.append(result.get("value"))
-
-    job_result: list = []
     try:
         if not (text or "").strip():
             message = "Error: text is empty."
             log(message)
-            yield out(console=mini_log(message), busy=False, bar=bar("Nothing to generate: the script is empty.", "error"))
+            yield out(console=mini_log(message), busy=False, bar=progress_bar_html(0, "Nothing to generate: the script is empty.", "", kind="error"))
             return
-        yield out(console="[ui] Preparing inference model", bar=bar())
-        print("[ui] Preparing inference model", flush=True)
-        ASR.unload()
+        yield out(console="[ui] Preparing inference model", bar=progress_bar_html(None, "Checking model files"))
+        if not adv.asr_check:
+            ASR.unload()
         MANAGER.set_v2_paths(V2_DEFAULT_MODEL, V2_DEFAULT_TOKENIZER)
         MANAGER.set_lora_adapter(lora_adapter)
-        state["phase"] = "Checking model files"
-        ready = ensure_tts_for_flow(model_version, progress)
+        ready = ensure_tts_for_flow(model_version)
         preset_audio, preset_text = _resolve_reference(ref_audio, voice_preset)
         final_ref_text = ref_text or preset_text
-        reference_note = ""
-        if preset_audio and lora_adapter and lora_adapter != NONE_ADAPTER:
-            reference_note = "LoRA + reference audio active; the same reference is reused for every segment."
-        segments = build_segments(text, chunk_mode, float(gap_seconds), carry_tags=bool(carry_tags))
-        carried = [i + 1 for i, s in enumerate(segments) if s.get("carried_tags")]
-        if carried:
-            print(f"[ui] Tags carried over to keep the delivery: segment(s) {carried} -> "
-                  f"{', '.join(sorted({segments[i - 1]['carried_tags'] for i in carried}))}", flush=True)
-        user_seed = int(seed)
-        use_shared_seed = bool(reuse_chunk_seed) or user_seed >= 0 or len(segments) <= 1
-        effective_seed = _effective_seed(seed) if use_shared_seed else -1
-        kwargs = _engine_kwargs(
-            text,
-            preset_audio,
-            final_ref_text,
-            temperature,
-            top_p,
-            top_k,
-            max_new_tokens,
-            ras_win_len,
-            ras_win_max_num_repeat,
-            effective_seed,
-            chunk_mode,
+        voice_name = voice_preset if voice_preset and voice_preset != "None" else (Path(ref_audio).stem if ref_audio else "")
+        # {voice:name} / {lora:name} tags switch the speaker from there on: one text, several voices
+        blocks = []
+        problems: list[str] = []
+        for run_text, run_voice, run_lora, run_pause in split_voice_runs(text):
+            base = Block(text="", ref_audio=preset_audio or None, ref_text=final_ref_text or "", lora=lora_adapter,
+                         speaker=voice_name, voice=voice_preset if voice_preset and voice_preset != "None" else "")
+            base = _tagged_block(base, "", run_voice, run_lora, model_version, problems)
+            # each segment is a block: with "voice only what changed" an edited sentence is the only one voiced again
+            for k, s in enumerate(build_segments(run_text, chunk_mode, float(gap_seconds), carry_tags=bool(carry_tags))):
+                pause = None if (k == 0 and blocks) else float(s.get("gap", 0.0))
+                if k == 0 and run_pause is not None:
+                    pause = run_pause
+                blocks.append(Block(**{**base.__dict__, "text": s["text"], "pause": pause}))
+        if problems:
+            gr.Warning(f"Not found, the text keeps the voice before it: {', '.join(sorted(set(problems)))}")
+        if not blocks:
+            raise ValueError("Nothing to voice: the text only has tags.")
+        sampling = Sampling(
+            model_version=model_version, temperature=max(float(temperature), 0.3), top_p=float(top_p), top_k=int(top_k),
+            max_frames=int(max_new_tokens), seed=int(seed), reuse_seed=bool(reuse_chunk_seed), chunk_mode="None",
+            carry_tags=False, ras_win_len=int(ras_win_len), ras_max_repeat=int(ras_win_max_num_repeat),
         )
-        kwargs["progress_cb"] = frame_progress
-        state["total_est"] = sum(max(50, int(len(s["text"]) * 1.8)) for s in segments) or 1
-        if chunk_mode == "None" and len(text) > 400:
-            print("[ui] Warning: 'None' mode with long text; Higgs V3 may skip words after ~25 s per pass.", flush=True)
-
-        state["phase"] = "Loading model, codec and LoRA"
-        fast_engine = False
-        if str(model_version).startswith("Higgs V3"):
-            print("[ui] Loading runtime, tokenizer, codec and LoRA", flush=True)
-
-            def load_v3():
-                MANAGER.unload_other(model_version)
-                MANAGER.v3.load()
-
-            yield from run_job(load_v3)
-            fast_engine = MANAGER.v3.fast_active
-
-        print(f"[ui] Synthesizing {len(segments)} segment(s) on the {'fast' if fast_engine else 'compatibility'} engine", flush=True)
-        if fast_engine:
-
-            def fast_job():
-                wav_out = None
-                for event in MANAGER.v3.stream(
-                    text,
-                    ref_audio=kwargs.get("ref_audio"),
-                    ref_text=kwargs.get("ref_text") or "",
-                    temperature=kwargs.get("temperature", 1.0),
-                    top_p=kwargs.get("top_p", 0.95),
-                    top_k=kwargs.get("top_k", 50),
-                    max_new_tokens=kwargs.get("max_new_tokens", 2048),
-                    seed=effective_seed,
-                    progress_cb=frame_progress,
-                    segments=segments,
-                    emit_audio=False,
-                ):
-                    if event["type"] == "segment":
-                        start_segment(event["index"], event["total"], event.get("text", ""))
-                    elif event["type"] == "done":
-                        wav_out = event["audio"]
-                return wav_out
-
-            yield from run_job(fast_job)
-            wav = job_result[-1]
-            if wav is None:
-                message = "Generation cancelled."
-                log(message)
-                yield out(console=mini_log(message), busy=False, bar=bar("Cancelled", "error"))
-                return
-            sr = SAMPLE_RATE
-            rtf = MANAGER.v3.last_rtf or 0.0
-            engine_log = (
-                f"Fast engine: {len(segments)} segment(s), {len(wav) / SAMPLE_RATE:.1f}s audio, "
-                f"{(1.0 / rtf) if rtf else 0.0:.2f}x realtime."
-                + (f" Adapter: {MANAGER.v3.loaded_adapter_path}." if MANAGER.v3.loaded_adapter_path else "")
-            )
-        else:
-            payloads = [{"text": s["text"], "ref_audio": preset_audio, "ref_text": final_ref_text} for s in segments]
-            base_kwargs = {k: v for k, v in kwargs.items() if k not in {"text", "ref_audio", "ref_text"}}
-            base_kwargs["chunk_mode"] = "None"
-            if use_shared_seed:
-                base_kwargs["seed"] = effective_seed
-
-            def chunk_progress(idx, total, chunk_text, chunk=None):
-                print(f"[ui] segment {idx}/{total}: {len(chunk_text or '')} chars", flush=True)
-                start_segment(idx, total, chunk_text)
-
-            def legacy_job():
-                return MANAGER.generate_many(model_version, payloads, float(gap_seconds), chunk_progress=chunk_progress, **base_kwargs)
-
-            yield from run_job(legacy_job)
-            sr, wav, engine_log = job_result[-1]
-            engine_log = f"{len(segments)} segment(s).\n{engine_log}"
-
-        state["phase"] = "Saving WAV"
-        if effective_seed >= 0:
-            seed_note = f"Seed used: {effective_seed}."
-        else:
-            seed_note = "Seed used: random per segment."
-        engine_log = f"{seed_note}\n{engine_log}"
-        if reference_note:
-            engine_log = f"{reference_note}\n{engine_log}"
-        reference_name = voice_preset if voice_preset and voice_preset != "None" else Path(ref_audio).stem if ref_audio else "no_reference"
-        out_path = _save_output(model_version, sr, wav, text=text, reference_name=reference_name, persist=bool(save_to_outputs))
-        _remember_inference_seed(effective_seed)
+        print(f"[ui] Voicing {len(blocks)} segment(s)", flush=True)
+        wav = results = None
+        elapsed = 0.0
+        for event in render_job(blocks, sampling, adv, float(gap_seconds), "single voice"):
+            if event[0] == "progress":
+                yield out(bar=event[1])
+            else:
+                _kind, wav, results, elapsed = event
+        sr = SAMPLE_RATE
+        report = results_report(results)
+        reference_name = voice_name or "no_reference"
+        out_path = _save_output(model_version, sr, wav, text=text, reference_name=reference_name, persist=bool(save_to_outputs), adv=adv)
+        if int(seed) >= 0:
+            _remember_inference_seed(int(seed))
         save_label = "Saved" if save_to_outputs else "Preview temp file"
-        message = f"{ready}\n{engine_log}\n{save_label}: {out_path}"
+        message = f"{ready}\n{report}\n{save_label}: {out_path}"
         log(message)
         notify_done()
-        seconds = len(wav) / float(sr) if sr else 0.0
-        elapsed = time.perf_counter() - started
+        seconds = len(wav) / float(sr)
         done_label = f"Done · {_fmt_duration(seconds)} of audio in {_fmt_clock(elapsed)} ({seconds / max(elapsed, 1e-6):.2f}x realtime)"
-        yield out(audio=fresh_audio_value(out_path), file=out_path, console=message, busy=False, bar=bar(done_label, "done"))
+        failed = sum(1 for r in results if not r.ok)
+        if failed:
+            done_label += f" · {failed} block(s) kept with issues"
+        yield out(audio=result_audio_value(out_path), file=out_path, console=message, busy=False,
+                  bar=progress_bar_html(100, done_label, report.splitlines()[-1] if report else "", kind="done"),
+                  blocks=blocks_payload(results, out_path, "Single voice", blocks))
+    except Cancelled:
+        message = "Generation cancelled."
+        log(message)
+        yield out(console=mini_log(message), busy=False, bar=progress_bar_html(0, "Cancelled", "", kind="error"))
     except Exception as exc:
         message = f"Error: {exc}"
         log(message)
-        yield out(console=message, busy=False, bar=bar(f"Error: {exc}", "error"))
+        yield out(console=message, busy=False, bar=progress_bar_html(0, f"Error: {exc}", "", kind="error"))
 
 
-def run_longform(
-    text,
-    model_version,
-    lora_adapter,
-    voice_preset,
-    ref_audio,
-    ref_text,
-    split_mode,
-    gap_seconds,
-    temperature,
-    top_p,
-    top_k,
-    max_new_tokens,
-    ras_win_len,
-    ras_win_max_num_repeat,
-    seed,
-    progress=gr.Progress(track_tqdm=False),
-):
-    try:
-        chunks = text_chunks_for_ui(text, split_mode)
-        if not chunks:
-            return None, None, log("Error: no text chunks found.")
-        ASR.unload()
-        MANAGER.set_v2_paths(V2_DEFAULT_MODEL, V2_DEFAULT_TOKENIZER)
-        MANAGER.set_lora_adapter(lora_adapter)
-        ready = ensure_tts_for_flow(model_version, progress)
-        preset_audio, preset_text = _resolve_reference(ref_audio, voice_preset)
-        final_ref_text = ref_text or preset_text
-        payloads = []
-        for idx, chunk in enumerate(chunks, 1):
-            if progress:
-                progress((idx - 1, len(chunks)), desc=f"Generating chunk {idx}/{len(chunks)}")
-            payloads.append({"text": chunk, "ref_audio": preset_audio, "ref_text": final_ref_text})
-        base_kwargs = {
-            "temperature": float(temperature),
-            "top_p": float(top_p),
-            "top_k": int(top_k),
-            "max_new_tokens": int(max_new_tokens),
-            "ras_win_len": int(ras_win_len),
-            "ras_win_max_num_repeat": int(ras_win_max_num_repeat),
-            "seed": int(seed),
-            "chunk_mode": "None",
-        }
+def run_inference_ui(*values):
+    """The Generate button: the 17 inference inputs, then the advanced settings (ADV_KEYS order)."""
+    yield from run_inference(*values[:17], adv=advanced_from_values(values[17:]))
 
-        def chunk_progress(idx, total, chunk_text):
-            print(f"[ui] long-form chunk {idx}/{total}: {len(chunk_text or '')} chars", flush=True)
-            progress(0.2 + 0.72 * ((idx - 1) / max(total, 1)), desc=f"Synthesizing chunk {idx}/{total}")
 
-        sr, wav, engine_log = MANAGER.generate_many(
-            model_version, payloads, float(gap_seconds), chunk_progress=chunk_progress, **base_kwargs
+DIALOGUE_INHERIT = "__inherit__"
+
+
+def dialogue_lora_choices(model_version: str | None) -> list[tuple[str, str]]:
+    """One flat LoRA list for a dialogue turn: Single voice's, none, then every checkpoint of every run."""
+    kind = _lora_kind(model_version)
+    out = [("Same as Single voice", DIALOGUE_INHERIT), ("None (base model)", NONE_ADAPTER)]
+    for project in lora_projects(kind):
+        for label, value in lora_checkpoints(kind, project):
+            out.append((f"{project} · {label.split(' · ')[0]}", value))
+    return out
+
+
+def run_dialogue(model_version, lora_adapter, temperature, top_p, top_k, max_new_tokens, ras_win_len,
+                 ras_win_max_num_repeat, seed, reuse_chunk_seed, save_to_outputs, chunk_mode, carry_tags, dialogue_json,
+                 only_changed, *values):
+    """Every turn with its own voice: library voice or reference audio, and its own LoRA."""
+    adv = advanced_from_values(values)
+    adv.only_changed = bool(only_changed)
+    started = time.perf_counter()
+
+    def out(audio=None, file=None, console=None, busy=True, bar=None, blocks=None):
+        return (
+            gr.update() if audio is None else audio,
+            gr.update() if file is None else file,
+            gr.update() if console is None else console,
+            set_button_busy("Generating dialogue…") if busy else restore_button("⚡ Generate Dialogue"),
+            gr.update(interactive=busy),
+            gr.update() if bar is None else bar,
+            gr.update() if blocks is None else blocks,
         )
-        reference_name = voice_preset if voice_preset and voice_preset != "None" else Path(ref_audio).stem if ref_audio else "no_reference"
-        out_path = _save_output(model_version, sr, wav, text=text, reference_name=reference_name)
-        if progress:
-            progress((len(chunks), len(chunks)), desc="Done")
-        notify_done()
-        return fresh_audio_value(out_path), out_path, log(f"{ready}\nLong-form chunks: {len(chunks)}\n{engine_log}\nSaved: {out_path}")
-    except Exception as exc:
-        return None, None, log(f"Error: {exc}")
 
-
-def run_dialogue(
-    model_version,
-    lora_adapter,
-    gap_seconds,
-    temperature,
-    top_p,
-    top_k,
-    max_new_tokens,
-    ras_win_len,
-    ras_win_max_num_repeat,
-    seed,
-    reuse_chunk_seed,
-    save_to_outputs,
-    chunk_mode,
-    carry_tags,
-    row_count,
-    *speaker_values,
-    progress=gr.Progress(track_tqdm=False),
-):
     try:
-        progress(0.03, desc="Preparing dialogue model")
-        ASR.unload()
+        if not adv.asr_check:
+            ASR.unload()
         MANAGER.set_v2_paths(V2_DEFAULT_MODEL, V2_DEFAULT_TOKENIZER)
-        MANAGER.set_lora_adapter(lora_adapter)
-        print("[ui] Preparing dialogue model", flush=True)
-        ready = ensure_tts_for_flow(model_version, progress)
-        turns = []
-        reference_names = []
-        visible_values = speaker_values[: max(1, int(row_count)) * 4]
-        active_rows = [
-            visible_values[idx : idx + 4]
-            for idx in range(0, len(visible_values), 4)
-            if (visible_values[idx] or "").strip()
-        ]
-        skipped_empty = (len(visible_values) // 4) - len(active_rows)
-        if skipped_empty:
-            print(f"[ui] Skipping {skipped_empty} empty dialogue rows.", flush=True)
-        active_row_total = len(active_rows)
-        for row_idx, (text, preset, audio, ref_text) in enumerate(active_rows, 1):
-            preset_audio, preset_text = _resolve_reference(audio, preset)
-            reference_names.append(preset if preset and preset != "None" else Path(audio).stem if audio else "no_reference")
-            row_chunks = text_chunks_for_ui(text, chunk_mode)
-            if carry_tags and len(row_chunks) > 1:
-                # Within one line the same speaker keeps its delivery; each line keeps only its own tags.
-                carried_segments = carry_sentence_tags([{"text": c} for c in row_chunks])
-                if any(seg.get("carried_tags") for seg in carried_segments):
-                    print(f"[ui] Dialogue row {row_idx}: tags carried over to {len(row_chunks) - 1} later chunk(s).", flush=True)
-                row_chunks = [seg["text"] for seg in carried_segments]
-            for chunk_idx, chunk in enumerate(row_chunks, 1):
-                turns.append({
-                    "text": _finish_sentence(chunk),
-                    "ref_audio": preset_audio,
-                    "ref_text": ref_text or preset_text,
-                    "_row_idx": row_idx,
-                    "_row_total": active_row_total,
-                    "_chunk_idx": chunk_idx,
-                    "_chunk_total": len(row_chunks),
-                })
-        if not turns:
+        yield out(console="Preparing dialogue model", bar=progress_bar_html(None, "Checking model files"))
+        ready = ensure_tts_for_flow(model_version)
+        rows = dialogue_rows_of(dialogue_json)
+        blocks: list[Block] = []
+        missing = []
+        for i, row in enumerate(rows, 1):
+            line = (row.get("text") or "").strip()
+            if not line:
+                continue
+            if row.get("audio") and not Path(row["audio"]).is_file():
+                missing.append(i)
+                row["audio"] = ""
+            if row.get("voice") not in list_voice_names():
+                missing.append(i)
+                row["voice"] = "None"
+            audio, preset_text = _resolve_reference(row.get("audio") or None, row.get("voice"))
+            lora = row.get("lora") or DIALOGUE_INHERIT
+            lora = lora_adapter if lora == DIALOGUE_INHERIT else lora
+            who = row.get("voice") if row.get("voice") and row.get("voice") != "None" else ""
+            if not who and row.get("audio"):
+                who = Path(row["audio"]).stem
+            if not who and lora and lora != NONE_ADAPTER:
+                who = adapter_project(lora)
+            blocks.append(Block(text=_finish_sentence(line), ref_audio=audio or None,
+                                ref_text=(row.get("ref_text") or preset_text or ""), lora=lora,
+                                speaker=who or f"Speaker {i}", voice=row.get("voice") or "",
+                                pause=pause_seconds(row.get("pause"))))
+        if missing:
+            gr.Warning(f"Line(s) {', '.join(map(str, sorted(set(missing))))}: a reference audio or library voice is gone; "
+                       "they use the model's own voice (or the first line's) instead.")
+        if not blocks:
             message = "Error: dialogue has no speaker text."
-            return None, None, mini_log(log(message)), restore_button("⚡ Generate Dialogue"), gr.update(interactive=False)
-        payloads = []
-        segment_total = len(turns)
-        for idx, turn in enumerate(turns, 1):
-            print(
-                f"[ui] Preparing dialogue row {turn['_row_idx']}/{turn['_row_total']} "
-                f"chunk {turn['_chunk_idx']}/{turn['_chunk_total']} "
-                f"(segment {idx}/{segment_total})",
-                flush=True,
-            )
-            payloads.append(turn)
-        base_kwargs = {
-            "temperature": float(temperature),
-            "top_p": float(top_p),
-            "top_k": int(top_k),
-            "max_new_tokens": int(max_new_tokens),
-            "ras_win_len": int(ras_win_len),
-            "ras_win_max_num_repeat": int(ras_win_max_num_repeat),
-            "seed": int(seed),
-            "chunk_mode": "None",
-        }
-        progress_state = {
-            "start": time.perf_counter(),
-            "total_start": time.perf_counter(),
-            "segment": 1,
-            "row_idx": 1,
-            "row_total": active_row_total,
-            "chunk_idx": 1,
-            "chunk_total": 1,
-        }
-
-        def frame_progress(frame, total, desc):
-            frame = int(frame)
-            total = int(total)
-            elapsed = max(time.perf_counter() - progress_state["start"], 1e-3)
-            fps = frame / elapsed
-            frames_per_sec = getattr(getattr(MANAGER, "v3", None), "frames_per_sec", None) if str(model_version).startswith("Higgs V3") else 25.0
-            frames_per_sec = frames_per_sec or 25.0
-            audio_sec = frame / float(frames_per_sec)
-            segment = int(progress_state["segment"])
-            done_frames = (segment - 1) * total + frame
-            total_frames = max(segment_total * total, 1)
-            total_elapsed = max(time.perf_counter() - progress_state["total_start"], 1e-3)
-            eta = max(total_frames - done_frames, 0) / max(done_frames / total_elapsed, 1e-3)
-            progress_desc = (
-                f"row {progress_state['row_idx']}/{progress_state['row_total']} "
-                f"chunk {progress_state['chunk_idx']}/{progress_state['chunk_total']} "
-                f"(segment {segment}/{segment_total}): {frame}/{total} frames · "
-                f"{fps:.2f} frame/s · ~{audio_sec:.1f}s audio · ETA total {eta / 60:.0f}m {eta % 60:02.0f}s"
-            )
-            if frame == 1 or frame % 32 == 0:
-                print(f"[ui-progress] {progress_desc}", flush=True)
-            progress((done_frames, total_frames), desc=progress_desc)
-
-        base_kwargs["progress_cb"] = frame_progress
-
-        def chunk_progress(idx, total, chunk_text, chunk=None):
-            chunk = chunk or {}
-            progress_state["segment"] = int(idx)
-            progress_state["row_idx"] = int(chunk.get("_row_idx", idx))
-            progress_state["row_total"] = int(chunk.get("_row_total", active_row_total))
-            progress_state["chunk_idx"] = int(chunk.get("_chunk_idx", 1))
-            progress_state["chunk_total"] = int(chunk.get("_chunk_total", 1))
-            progress_state["start"] = time.perf_counter()
-            print(
-                f"[ui] dialogue row {progress_state['row_idx']}/{progress_state['row_total']} "
-                f"chunk {progress_state['chunk_idx']}/{progress_state['chunk_total']} "
-                f"(segment {idx}/{segment_total}): {len(chunk_text or '')} chars",
-                flush=True,
-            )
-            progress(
-                ((idx - 1) * int(max_new_tokens), max(segment_total * int(max_new_tokens), 1)),
-                desc=(
-                    f"Loading/generating dialogue row {progress_state['row_idx']}/{progress_state['row_total']} "
-                    f"chunk {progress_state['chunk_idx']}/{progress_state['chunk_total']} "
-                    f"(segment {idx}/{segment_total})"
-                ),
-            )
-
-        sr, wav, engine_log = MANAGER.generate_many(
-            model_version, payloads, float(gap_seconds), chunk_progress=chunk_progress, **base_kwargs
+            yield out(console=mini_log(log(message)), busy=False, bar=progress_bar_html(0, message, "", kind="error"))
+            return
+        sampling = Sampling(
+            model_version=model_version, temperature=max(float(temperature), 0.3), top_p=float(top_p), top_k=int(top_k),
+            max_frames=int(max_new_tokens), seed=int(seed), reuse_seed=bool(reuse_chunk_seed), chunk_mode=chunk_mode,
+            carry_tags=bool(carry_tags), ras_win_len=int(ras_win_len), ras_max_repeat=int(ras_win_max_num_repeat),
         )
-        refs = "_".join(dict.fromkeys(reference_names)) or "no_reference"
-        out_path = _save_output(
-            model_version,
-            sr,
-            wav,
-            text=" ".join(turn.get("text", "") for turn in turns),
-            reference_name=refs,
-            persist=bool(save_to_outputs),
-        )
-        progress(0.97, desc="Completion chime")
+        wav = results = None
+        elapsed = 0.0
+        for event in render_job(blocks, sampling, adv, 0.15, "dialogue"):
+            if event[0] == "progress":
+                yield out(bar=event[1])
+            else:
+                _kind, wav, results, elapsed = event
+        report = results_report(results)
+        refs = "_".join(dict.fromkeys(b.speaker for b in blocks)) or "no_reference"
+        out_path = _save_output(model_version, SAMPLE_RATE, wav, text=" ".join(b.text for b in blocks), reference_name=refs,
+                                persist=bool(save_to_outputs), adv=adv)
         notify_done()
-        progress(1.0, desc="Done")
         save_label = "Saved" if save_to_outputs else "Preview temp file"
-        skipped_note = f"\nSkipped empty rows: {skipped_empty}" if skipped_empty else ""
-        message = f"{ready}\nDialogue rows: {active_row_total}{skipped_note}\nGenerated segments: {len(turns)}\nSplit mode: {chunk_mode}\n{engine_log}\n{save_label}: {out_path}"
+        message = f"{ready}\nDialogue turns: {len(blocks)}\n{report}\n{save_label}: {out_path}"
         log(message)
-        return fresh_audio_value(out_path), out_path, message, restore_button("⚡ Generate Dialogue"), gr.update(interactive=False)
+        seconds = len(wav) / float(SAMPLE_RATE)
+        done_label = f"Done · {_fmt_duration(seconds)} of dialogue in {_fmt_clock(elapsed)}"
+        yield out(audio=result_audio_value(out_path), file=out_path, console=message, busy=False,
+                  bar=progress_bar_html(100, done_label, report.splitlines()[-1] if report else "", kind="done"),
+                  blocks=blocks_payload(results, out_path, "Dialogue", blocks))
+    except Cancelled:
+        yield out(console=mini_log(log("Dialogue cancelled.")), busy=False, bar=progress_bar_html(0, "Cancelled", "", kind="error"))
     except Exception as exc:
         message = f"Error: {exc}"
         log(message)
-        return None, None, message, restore_button("⚡ Generate Dialogue"), gr.update(interactive=False)
+        yield out(console=message, busy=False, bar=progress_bar_html(0, f"Error: {exc}", "", kind="error"))
 
 
 def refresh_voices():
     choices = list_voice_names()
-    return [gr.update(choices=choices, value="None") for _ in range(6)] + [
+    return [gr.update(choices=choices, value="None") for _ in range(2)] + [
         log(f"Voice library refreshed: {len(choices) - 1} voices.")
     ]
 
 
 def save_sample(audio_path, sample_name, transcript):
     status = save_voice_sample(audio_path, sample_name, transcript)
+    if status.startswith("Saved voice sample: "):
+        dest = SAMPLES_DIR / status.split(": ", 1)[1].strip()
+        if loudness.normalize_file(dest):
+            status += f" · loudness {loudness.SETTINGS['target']:g} LUFS"
     notify_done()
     choices = list_voice_names()
-    return [gr.update(choices=choices, value="None") for _ in range(6)] + [log(status)]
+    return [gr.update(choices=choices, value="None") for _ in range(2)] + [log(status)]
 
 
 def stop_generation():
@@ -1654,6 +1703,50 @@ def _delete_files_in(folder: Path, suffixes: set[str]) -> str:
     return f"Deleted {deleted} files from {folder}."
 
 
+AUDIO_SUFFIXES = {".wav", ".mp3", ".flac", ".ogg", ".m4a"}
+
+
+def _files_in(folder: Path, suffixes: set[str]) -> tuple[int, int]:
+    n = size = 0
+    if folder.exists():
+        for path in folder.rglob("*"):
+            if path.is_file() and path.suffix.lower() in suffixes:
+                n += 1
+                size += path.stat().st_size
+    return n, size
+
+
+def danger_ask(kind: str, name: str | None = None):
+    """The confirmation of a destructive button: (pending kind, show the modal, what will happen)."""
+    if kind == "outputs":
+        n, size = _files_in(OUTPUTS_DIR, AUDIO_SUFFIXES)
+        text = (f"**{n} audio file(s), {size / 1e6:,.1f} MB** in `outputs/` are deleted: every generated audio, the "
+                "timeline's voiced lines and the separated voices. Timeline clips that use them stop playing. "
+                "**This cannot be undone.**")
+    elif kind == "samples":
+        n, _size = _files_in(SAMPLES_DIR, AUDIO_SUFFIXES)
+        text = (f"**{n} voice(s)** of the voice library are deleted with their transcripts. "
+                "**This cannot be undone.**")
+    elif kind == "preset":
+        if not name or not (GUI_PRESETS_DIR / f"{name}.json").is_file():
+            gr.Warning("Pick a saved preset first.")
+            return "", gr.update(visible=False), gr.update()
+        text = f"The GUI preset **{name}** is deleted. The settings on the page stay as they are."
+    else:
+        return "", gr.update(visible=False), gr.update()
+    return kind, gr.update(visible=True), text
+
+
+def danger_run(kind: str, preset_name: str | None):
+    if kind == "outputs":
+        return "", gr.update(visible=False), delete_output_audios(), gr.update()
+    if kind == "samples":
+        return "", gr.update(visible=False), delete_reference_samples(), gr.update()
+    if kind == "preset":
+        return "", gr.update(visible=False), gr.update(), delete_gui_preset(preset_name)
+    return "", gr.update(visible=False), gr.update(), gr.update()
+
+
 def delete_output_audios():
     return log(_delete_files_in(OUTPUTS_DIR, {".wav", ".mp3", ".flac", ".ogg", ".m4a"}))
 
@@ -1696,6 +1789,93 @@ def save_sample_ui(audio_path, sample_name, transcript):
     result = save_sample(audio_path, sample_name, transcript)
     status = result[-1]
     return [*result[:-1], mini_log(status), restore_button("💾 Save Sample")]
+
+
+CLEANED_REFS_DIR = OUTPUTS_DIR / "cleaned_refs"
+REF_CLEAN_ENGINES = [(label, key) for label, key in CLEAN_ENGINES if key != "off"]
+
+
+def clean_reference_audio(audio_path, engine, original, progress=gr.Progress(track_tqdm=False)):
+    """Separate the voice from music, noise or other voices in a reference clip (any engine or chain).
+
+    Returns (cleaned audio, original path kept for ↩, status). The clip keeps its sample rate; mono."""
+    if not audio_path or not Path(str(audio_path)).is_file():
+        gr.Warning("Load a reference audio first.")
+        return gr.update(), original, "No audio to clean."
+    engine = str(engine or "").strip()
+    if not engine or engine == "off":
+        return gr.update(), original, "Pick a separation model."
+    import soundfile as sf
+
+    from higgs_local.dataset_audio import DatasetAudioProcessor, _mono
+
+    src = Path(str(audio_path))
+    progress(0.1, desc=f"Separating the voice · {_engine_label(engine)}")
+    try:
+        dst, note = separate_file(src, engine)
+    except Exception as exc:
+        gr.Warning(f"Separation failed: {exc}")
+        print(f"[clean] {src.name}: {exc}", flush=True)
+        return gr.update(), original, f"❌ {exc}"
+    keep = original if original and Path(str(original)).is_file() else str(src)
+    return str(dst), keep, note + " ↩ brings back the original."
+
+
+def _engine_label(engine: str) -> str:
+    return dict((k, l) for l, k in CLEAN_ENGINES).get(engine, engine)
+
+
+SEPARATE_LOCK = threading.Lock()
+
+
+def separate_file(src: Path, engine: str) -> tuple[Path, str]:
+    """Keep only the voice of one clip (any engine or chain ``a+b``); mono, same sample rate, in outputs/cleaned_refs."""
+    import soundfile as sf
+
+    from higgs_local.dataset_audio import DatasetAudioProcessor, _mono
+
+    with SEPARATE_LOCK:  # one separation at a time on the GPU
+        proc = DatasetAudioProcessor()
+        try:
+            t0 = time.time()
+            audio, sr = sf.read(str(src), dtype="float32", always_2d=True)
+            clean = proc.clean(_mono(audio), int(sr), engine)
+            clean = loudness.normalize(clean, int(sr))
+            peak = float(np.max(np.abs(clean))) if len(clean) else 0.0
+            if peak > 0.98:
+                clean = clean * (0.98 / peak)
+            CLEANED_REFS_DIR.mkdir(parents=True, exist_ok=True)
+            dst = CLEANED_REFS_DIR / f"{src.stem[:50]}_{engine.replace('+', '-')}_{time.strftime('%H%M%S')}.wav"
+            sf.write(str(dst), clean, int(sr), subtype="PCM_16")
+        finally:
+            proc.unload()
+    note = f"✅ {_engine_label(engine)} · {len(clean) / sr:.1f} s in {time.time() - t0:.1f} s."
+    print(f"[clean] {src.name}: {note}", flush=True)
+    return dst, note
+
+
+def separate_ref_server(*args):
+    """Server function for the page editors (dialogue lines, timeline dialog): separate one reference."""
+    from higgs_local.live import _server_args
+
+    path, engine = _server_args(args, 2)
+    src = Path(str(path or ""))
+    if not src.is_file():
+        return {"ok": False, "error": "The reference audio is gone."}
+    if not engine or engine == "off":
+        return {"ok": False, "error": "Pick a separation model."}
+    try:
+        dst, note = separate_file(src, str(engine))
+    except Exception as exc:
+        print(f"[clean] {src.name}: {exc}", flush=True)
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True, "path": str(dst.resolve()), "url": montage.file_url(str(dst)), "name": dst.name, "note": note}
+
+
+def restore_reference_audio(original):
+    if original and Path(str(original)).is_file():
+        return original, None, "↩ Original audio back."
+    return gr.update(), None, "No original to bring back."
 
 
 def set_v3_runtime(precision, attention_backend, compile_enabled):
@@ -2577,16 +2757,21 @@ def update_clips_count(text, chunk_mode):
     text = (text or "").strip()
     if not text:
         return gr.update(value="")
+    runs = split_voice_runs(text)
     if chunk_mode == SEAMLESS_MODE:
-        count = max(len(build_segments(text, chunk_mode)), 1)
+        count = sum(max(len(build_segments(t, chunk_mode)), 1) for t, *_ in runs)
     elif chunk_mode == "None":
-        count = 1
+        count = len(runs)
     else:
-        count = max(len(text_chunks_for_ui(text, chunk_mode)), 1)
+        count = sum(max(len(text_chunks_for_ui(t, chunk_mode)), 1) for t, *_ in runs)
+    voices = len(runs)
+    text = VOICE_TAG_RE.sub(" ", text)
     words = len(text.split())
     est = len(text) / 14.0  # ~14 characters per second of speech
     est_label = f"{est:.0f} s" if est < 90 else f"{est / 60:.1f} min"
     parts = [f"{len(text):,} characters", f"{words:,} words", f"{count} segment{'s' if count != 1 else ''}", f"≈ {est_label} of audio"]
+    if voices > 1:
+        parts.insert(3, f"{voices} parts (voice / pause tags)")
     warn = " · ⚠️ single pass over ~25 s may skip words" if chunk_mode == "None" and len(text) > 400 else ""
     return gr.update(value=" · ".join(parts) + warn)
 
@@ -2645,6 +2830,7 @@ def prepare_higgs_dataset(
                     vad_trim=bool(ready_vad_trim),
                     min_speech_ratio=float(ready_min_speech or 0.0),
                     normalize=bool(ready_normalize),
+                    target_lufs=float(loudness.SETTINGS["target"]),
                 ),
                 use_metadata_split=bool(ready_use_split),
                 progress=lambda fraction, desc: progress(fraction, desc=desc),
@@ -2680,7 +2866,8 @@ def prepare_higgs_dataset(
         min_sec = float(min_segment_sec)
         max_sec = max(float(max_segment_sec), min_sec + 1.0)
         audio_options = SegmentOptions(
-            isolate=clean_engine != "off", engine=clean_engine, segment=bool(segment_voice), min_sec=min_sec, max_sec=max_sec
+            isolate=clean_engine != "off", engine=clean_engine, segment=bool(segment_voice), min_sec=min_sec, max_sec=max_sec,
+            target_lufs=float(loudness.SETTINGS["target"]),
         )
 
         def asr_transcribe(audio_path: str) -> str:
@@ -3016,6 +3203,7 @@ def start_higgs_training(
     v3_min_delta=0.002,
     v3_restore_best=True,
     v3_max_batch_sec=40,
+    v3_best_only=False,
 ):
     global LAST_TRAINING_DONE_KEY
     LAST_TRAINING_DONE_KEY = None
@@ -3087,6 +3275,7 @@ def start_higgs_training(
                 "early_stop_min_delta": float(v3_min_delta),
                 "restore_best": bool(v3_restore_best),
                 "max_batch_seconds": float(v3_max_batch_sec),
+                "best_only": bool(v3_best_only),
             }
             save_project_config(output_name or "higgs_v3_lora", "Higgs V3 TTS", project_args, resume_checkpoint or "")
             cmd, pretty = build_v3_training_command(
@@ -3123,6 +3312,7 @@ def start_higgs_training(
                 early_stop_min_delta=float(v3_min_delta or 0.0),
                 restore_best=bool(v3_restore_best),
                 max_batch_seconds=float(v3_max_batch_sec or 40),
+                best_only=bool(v3_best_only),
             )
             status, tail = TRAINING.start(cmd, output_name or "higgs_v3_lora")
             message = (
@@ -3572,6 +3762,1293 @@ Changing chunk mode changes how many clips are generated and joined.
 """
 
 
+# ================================================================ LLM, director, podcast, fixer, montage
+LLM_KEYS = ["provider", "local_model", "url", "api_key", "remote_model", "ctx", "temperature", "free_tts"]
+LLM_STATE = {"free_tts": True}
+
+
+def llm_config_from(values) -> llm.LLMConfig:
+    data = dict(zip(LLM_KEYS, values))
+    LLM_STATE["free_tts"] = bool(data.get("free_tts", True))
+    return llm.LLMConfig(
+        provider=data.get("provider") or "Local (llama.cpp)",
+        local_model=data.get("local_model") or llm.default_local_choice(),
+        url=data.get("url") or "",
+        api_key=data.get("api_key") or "",
+        remote_model=data.get("remote_model") or "",
+        ctx=int(data.get("ctx") or 16384),
+        temperature=float(data.get("temperature") or 0.7),
+        free_tts=bool(data.get("free_tts", True)),
+    )
+
+
+def _free_tts_for_llm():
+    """A local LLM is about to load: the speech and check models leave the GPU first when asked."""
+    if LLM_STATE.get("free_tts"):
+        print("[llm] freeing the speech and check models before the local LLM loads", flush=True)
+        MANAGER.unload_all()
+        ASR.unload()
+        tc.EMBEDDER.unload()
+        gc.collect()
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+
+def _stop_llm_for_tts():
+    if llm.SERVER.running and LLM_STATE.get("free_tts"):
+        print("[llm] stopping the local LLM before voicing (frees its VRAM)", flush=True)
+        llm.SERVER.stop()
+
+
+def llm_save_settings(*values):
+    data = dict(zip(LLM_KEYS, values))
+    data.pop("api_key", None)  # the key stays in memory only
+    try:
+        llm.SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        llm.SETTINGS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+    except OSError:
+        pass
+    LLM_STATE["free_tts"] = bool(data.get("free_tts", True))
+
+
+def llm_load_settings() -> dict:
+    try:
+        return json.loads(llm.SETTINGS_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def llm_check(provider, url, api_key, local_model):
+    if str(provider).startswith("Local"):
+        installed = llm.llama_installed()
+        m = llm.LOCAL_BY_LABEL.get(local_model)
+        have = (m is None and Path(str(local_model)).is_file()) or (m is not None and llm.model_installed(m))
+        state = "running" if llm.SERVER.running else "not loaded"
+        return (
+            f"Local llama.cpp: engine {'installed' if installed else 'not installed (downloaded on first use, 590 MB)'} · "
+            f"model {'on disk' if have else 'not downloaded yet'} · server {state}.",
+            gr.update(),
+        )
+    ok, message, models = llm.check_remote(url, api_key)
+    return ("✅ " if ok else "❌ ") + message, gr.update(choices=models, value=models[0] if models else None)
+
+
+def llm_download(local_model, progress=gr.Progress(track_tqdm=False)):
+    try:
+        def prog(frac, desc):
+            progress(frac if frac is not None else 0.0, desc=desc)
+
+        llm.ensure_llama(prog)
+        path = llm.ensure_local_model(local_model, prog)
+        notify_done()
+        return f"✅ Ready: {path.name}", gr.update(choices=llm.local_choices(), value=local_model)
+    except Exception as exc:
+        return f"❌ {exc}", gr.update()
+
+
+def llm_unload():
+    return llm.SERVER.stop()
+
+
+def tag_rules_v3() -> tuple[str, set[str]]:
+    tags = []
+    for category, values in TAG_CATALOG.items():
+        for value in values:
+            tag = f"<|{category}:{value}|>"
+            if category == "sfx":
+                tags.append(f"{tag}{SFX_SOUNDS.get(value, [''])[0]} (inline, sound word after)")
+            elif category == "prosody" and value in ("pause", "long_pause"):
+                tags.append(f"{tag} (inline)")
+            else:
+                tags.append(tag)
+    known = {f"<|{c}:{v}|>" for c, vs in TAG_CATALOG.items() for v in vs}
+    return ", ".join(tags), known
+
+
+DIRECTOR_OPS = {
+    "review": "Review the script",
+    "tags": "Add tags (director)",
+    "punctuate": "Punctuate for pauses (director)",
+    "continue": "Continue the script (director)",
+    "split": "Split direct speech",
+    "accents": "Accents and ё",
+}
+
+
+def _llm_lang(language: str) -> str:
+    from higgs_local.asr import WHISPER_LANGS as _W
+
+    return _W.get(language) or (language if language in PODCAST_LANGS else "auto")
+
+
+def director_lines(op: str, lines: list[dict], instruction: str, language: str, cfg: llm.LLMConfig, progress=None):
+    """Apply a text operation to lines [{speaker, text}]: the new texts and how many lines kept their text."""
+    lang = _llm_lang(language)
+    payload = [{"id": str(i), "speaker": ln.get("speaker", ""), "text": ln["text"]} for i, ln in enumerate(lines)]
+    if op == "tags":
+        rules, known = tag_rules_v3()
+        return llm.add_tags(cfg, payload, lang, rules, known, progress, _free_tts_for_llm)
+    if op == "punctuate":
+        return llm.punctuate(cfg, payload, lang, progress, _free_tts_for_llm)
+    if op == "accents":
+        return llm.accents(cfg, payload, lang, progress, _free_tts_for_llm)
+    if op == "review":
+        return llm.review(cfg, payload, lang, instruction, progress, _free_tts_for_llm)
+    raise ValueError(op)
+
+
+def _director_note(op, changed, refused, total):
+    name = DIRECTOR_OPS.get(op, op)
+    note = f"🧠 {name}: {changed} of {total} line(s) changed."
+    if refused:
+        note += f" {refused} answer(s) changed words and were not taken (those lines kept their text)."
+    return note
+
+
+def director_inference(op, text, instruction, language, *llm_values, progress=gr.Progress(track_tqdm=False)):
+    """Inference script: paragraphs are the lines; 'continue' appends, 'split' fills the Dialogue rows."""
+    cfg = llm_config_from(llm_values)
+    text = text or ""
+    if not text.strip() and op != "continue":
+        return gr.update(), "The script is empty.", [], gr.update()
+    prog = lambda f, d: progress(f or 0.0, desc=d)  # noqa: E731
+    try:
+        if op == "continue":
+            more = llm.continue_script(cfg, [{"name": "Narrator"}], [("Narrator", p) for p in re.split(r"\n\s*\n", text) if p.strip()] or [("Narrator", "")],
+                                       _llm_lang(language), 1.0, instruction, tag_rules_v3()[0], prog, _free_tts_for_llm)
+            added = "\n\n".join(ln["text"] for ln in more)
+            return (text.rstrip() + "\n\n" + added).strip(), f"🧠 Continued with {len(more)} paragraph(s).", [], gr.update()
+        if op == "split":
+            lines = llm.split_direct_speech(cfg, text, "Narrator", _llm_lang(language), prog, _free_tts_for_llm)
+            return gr.update(), f"🧠 Split into {len(lines)} lines: sent to the Dialogue tab.", lines, gr.update(selected="tab_dialogue")
+        paragraphs = [p for p in re.split(r"(\n\s*\n)", text)]
+        idx = [i for i, p in enumerate(paragraphs) if p.strip() and not re.fullmatch(r"\n\s*\n", p)]
+        new, refused = director_lines(op, [{"text": paragraphs[i]} for i in idx], instruction, language, cfg, prog)
+        changed = sum(1 for i, t in zip(idx, new) if t != paragraphs[i])
+        for i, t in zip(idx, new):
+            paragraphs[i] = t
+        return "".join(paragraphs), _director_note(op, changed, refused, len(idx)), [], gr.update()
+    except Exception as exc:
+        return gr.update(), f"❌ {exc}", [], gr.update()
+
+
+def dialogue_from_lines(lines, value, model_version):
+    """Lines [{speaker, text}] (a split of the script) added to the dialogue builder."""
+    if not lines:
+        return gr.update(), gr.update()
+    rows = [r for r in dialogue_rows_of(value) if (r.get("text") or "").strip()]
+    voices = list_voice_names()
+    for ln in lines:
+        name = ln.get("speaker") or "None"
+        template = next((r for r in rows if r.get("_speaker") == name), None)
+        voice = name if name in voices else (template or {}).get("voice", "None")
+        row = dialogue_row(ln["text"], voice, (template or {}).get("lora", DIALOGUE_INHERIT), (template or {}).get("audio", ""),
+                           (template or {}).get("ref_text", ""))
+        row["_speaker"] = name
+        rows.append(row)
+    return dialogue_value(value, rows, model_version), f"{len(lines)} line(s) added to the dialogue."
+
+
+def director_dialogue(op, instruction, language, value, model_version, *llm_values, progress=gr.Progress(track_tqdm=False)):
+    cfg = llm_config_from(llm_values)
+    rows = dialogue_rows_of(value)
+    active = [i for i, r in enumerate(rows) if (r.get("text") or "").strip()]
+    prog = lambda f, d: progress(f or 0.0, desc=d)  # noqa: E731
+    try:
+        names = [_row_name(r, i) for i, r in enumerate(rows)]
+        if op == "continue":
+            speakers = [{"name": n} for n in dict.fromkeys(names[i] for i in active)] or [{"name": "Speaker 1"}]
+            more = llm.continue_script(cfg, speakers, [(names[i], rows[i]["text"]) for i in active], _llm_lang(language), 1.0,
+                                       instruction, tag_rules_v3()[0], prog, _free_tts_for_llm)
+            out = [rows[i] for i in active]
+            for ln in more:
+                template = next((rows[i] for i in reversed(active) if names[i] == ln["speaker"]), out[-1] if out else dialogue_row())
+                out.append({**template, "id": _new_row_id(), "text": ln["text"]})
+            return dialogue_value(value, out, model_version), f"🧠 Continued with {len(more)} line(s)."
+        if op == "split":
+            return gr.update(), "Split direct speech works on the Single voice script."
+        new, refused = director_lines(op, [{"speaker": names[i], "text": rows[i]["text"]} for i in active], instruction, language, cfg, prog)
+        changed = 0
+        for i, t in zip(active, new):
+            changed += t != rows[i]["text"]
+            rows[i]["text"] = t
+        return dialogue_value(value, rows, model_version), _director_note(op, changed, refused, len(active))
+    except Exception as exc:
+        return gr.update(), f"❌ {exc}"
+
+
+def _row_name(row, i):
+    if row.get("_speaker"):
+        return row["_speaker"]
+    if row.get("voice") and row["voice"] != "None":
+        return row["voice"]
+    if row.get("audio"):
+        return Path(row["audio"]).stem
+    if row.get("lora") and row["lora"] not in (NONE_ADAPTER, DIALOGUE_INHERIT):
+        return adapter_project(row["lora"])
+    return f"Speaker {i + 1}"
+
+
+# ---------------------------------------------------------------- podcast
+PODCAST_MAX_SPEAKERS = 6
+PODCAST_LANGS = ["auto", "es", "en", "pt", "fr", "de", "it", "ru", "zh", "ja", "ko", "pl", "nl", "tr", "uk"]
+
+
+PODCAST_SPK_FIELDS = 7  # name, manner, voice, LoRA, own reference audio, its transcript, pause before (ms)
+
+
+def podcast_speakers(count, values) -> list[dict]:
+    out = []
+    n = PODCAST_SPK_FIELDS
+    for i in range(max(1, min(int(count), PODCAST_MAX_SPEAKERS))):
+        name, manner, voice, lora, audio, ref_text, pause = (list(values[i * n : i * n + n]) + [None] * n)[:n]
+        audio = str(audio) if audio and Path(str(audio)).is_file() else ""
+        out.append({"name": (name or f"Speaker {i + 1}").strip(), "manner": (manner or "").strip(), "voice": voice or "None",
+                    "lora": lora or DIALOGUE_INHERIT, "audio": audio, "ref_text": (ref_text or "").strip(),
+                    "pause": pause_seconds(pause)})
+    return out
+
+
+def podcast_value(value, speakers: list[dict] | None = None, blocks: list[dict] | None = None, model_version="Higgs V3 TTS") -> str:
+    data = _podcast_data(value)
+    if speakers is not None:
+        data["speakers"] = [{"name": s["name"]} for s in speakers]
+    if blocks is not None:
+        data["blocks"] = blocks
+    data["voices"] = list_voice_names()
+    data["loras"] = [[label, val] for label, val in dialogue_lora_choices(model_version)]
+    data["rev"] = int(data.get("rev", 0)) + 1
+    return json.dumps(data, ensure_ascii=False)
+
+
+def _podcast_data(value) -> dict:
+    try:
+        data = json.loads(value) if isinstance(value, str) else (value or {})
+    except json.JSONDecodeError:
+        data = {}
+    data.setdefault("speakers", [])
+    data.setdefault("blocks", [])
+    return data
+
+
+def _new_block(speaker, text, direction=""):
+    import uuid
+
+    return {"id": uuid.uuid4().hex[:8], "speaker": speaker, "text": text, "direction": direction, "voice": "", "lora": ""}
+
+
+def podcast_sync(value, model_version, count, *speaker_values):
+    return podcast_value(value, podcast_speakers(count, speaker_values), None, model_version)
+
+
+def _spoken_words(texts) -> int:
+    return sum(len(llm.TAG_LIKE.sub(" ", t or "").split()) for t in texts)
+
+
+def _podcast_fill(cfg, speakers, lines, language, target_words, direction, rules, progress, close_at_end=True):
+    """An LLM writes shorter than asked: the script is written without its ending, continued until the length is
+    nearly reached, then closed by a last round (so the goodbyes come once, at the end)."""
+    for _round in range(12):
+        have = _spoken_words([ln["text"] for ln in lines])
+        missing = target_words - have
+        if not close_at_end and have >= target_words * 0.92:
+            break
+        closing = (missing <= max(60, target_words * 0.2)) if close_at_end else None
+        progress(min(0.95, have / max(target_words, 1)),
+                 desc=f"{'Closing the episode' if closing else 'Writing more'}: {have}/{target_words} words…")
+        more = llm.continue_script(cfg, speakers, [(ln["speaker"], ln["text"]) for ln in lines], language,
+                                   max(0.25, max(missing, 40) / llm.WORDS_PER_MINUTE), direction, rules, None,
+                                   _free_tts_for_llm, closing=closing)
+        if not more:
+            break
+        lines = lines + more
+        if (closing and close_at_end) or _spoken_words([ln["text"] for ln in more]) < 10:
+            break
+    return lines
+
+
+def podcast_write(value, topic, language, minutes, model_version, count, *values, progress=gr.Progress(track_tqdm=False)):
+    sp_values, llm_values = values[: PODCAST_MAX_SPEAKERS * PODCAST_SPK_FIELDS], values[PODCAST_MAX_SPEAKERS * PODCAST_SPK_FIELDS :]
+    cfg = llm_config_from(llm_values)
+    speakers = podcast_speakers(count, sp_values)
+    if not (topic or "").strip():
+        return gr.update(), "Write the topic or a prompt for the conversation first."
+    try:
+        target = int(float(minutes) * llm.WORDS_PER_MINUTE)
+        rules = tag_rules_v3()[0]
+        lines = llm.write_podcast(cfg, topic.strip(), speakers, language, float(minutes) * 0.85, rules,
+                                  lambda f, d: progress(f or 0.0, desc=d), _free_tts_for_llm, closing=False)
+        lines = _podcast_fill(cfg, speakers, lines, language, target, "", rules, progress)
+        blocks = [_new_block(ln["speaker"], ln["text"], ln.get("direction", "")) for ln in lines]
+        words = _spoken_words([b["text"] for b in blocks])
+        return (podcast_value(value, speakers, blocks, model_version),
+                f"🧠 {len(blocks)} block(s), about {words} words (~{words / llm.WORDS_PER_MINUTE:.1f} min of the {float(minutes):g} asked).")
+    except Exception as exc:
+        return gr.update(), f"❌ {exc}"
+
+
+def podcast_continue(value, direction, language, minutes, model_version, count, *values, progress=gr.Progress(track_tqdm=False)):
+    sp_values, llm_values = values[: PODCAST_MAX_SPEAKERS * PODCAST_SPK_FIELDS], values[PODCAST_MAX_SPEAKERS * PODCAST_SPK_FIELDS :]
+    cfg = llm_config_from(llm_values)
+    speakers = podcast_speakers(count, sp_values)
+    data = _podcast_data(value)
+    written = [(b["speaker"], b["text"]) for b in data["blocks"] if b.get("text", "").strip()]
+    if not written:
+        return gr.update(), "There is no script to continue: write one first."
+    try:
+        rules = tag_rules_v3()[0]
+        lines = llm.continue_script(cfg, speakers, written, language, float(minutes), direction or "", rules,
+                                    lambda f, d: progress(f or 0.0, desc=d), _free_tts_for_llm)
+        before = [{"speaker": s, "text": t} for s, t in written]
+        target = _spoken_words(t for _s, t in written) + int(float(minutes) * llm.WORDS_PER_MINUTE)
+        lines = _podcast_fill(cfg, speakers, before + lines, language, target, direction or "", rules, progress,
+                              close_at_end=False)[len(before):]
+        blocks = data["blocks"] + [_new_block(ln["speaker"], ln["text"], ln.get("direction", "")) for ln in lines]
+        return podcast_value(value, speakers, blocks, model_version), f"🧠 {len(lines)} block(s) added after the last one."
+    except Exception as exc:
+        return gr.update(), f"❌ {exc}"
+
+
+def podcast_clear(value, model_version, count, *speaker_values):
+    return podcast_value(value, podcast_speakers(count, speaker_values), [], model_version), "Blocks cleared; speakers and settings stay."
+
+
+def podcast_director(op, instruction, language, value, model_version, count, *values, progress=gr.Progress(track_tqdm=False)):
+    sp_values, llm_values = values[: PODCAST_MAX_SPEAKERS * PODCAST_SPK_FIELDS], values[PODCAST_MAX_SPEAKERS * PODCAST_SPK_FIELDS :]
+    cfg = llm_config_from(llm_values)
+    data = _podcast_data(value)
+    blocks = data["blocks"]
+    if op == "continue":
+        return podcast_continue(value, instruction, _llm_lang(language), 1.0, model_version, count, *values, progress=progress)
+    if op == "split":
+        return gr.update(), "Split direct speech works on the Single voice script."
+    if not blocks:
+        return gr.update(), "There are no blocks yet."
+    try:
+        new, refused = director_lines(op, [{"speaker": b["speaker"], "text": b["text"]} for b in blocks], instruction, language, cfg,
+                                      lambda f, d: progress(f or 0.0, desc=d))
+        changed = 0
+        for b, t in zip(blocks, new):
+            changed += t != b["text"]
+            b["text"] = t
+        return podcast_value(json.dumps(data), podcast_speakers(count, sp_values), blocks, model_version), _director_note(op, changed, refused, len(blocks))
+    except Exception as exc:
+        return gr.update(), f"❌ {exc}"
+
+
+def podcast_to_dialogue(value, dlg_value, model_version, count, *values):
+    sp_values = values[: PODCAST_MAX_SPEAKERS * PODCAST_SPK_FIELDS]
+    speakers = {s["name"]: s for s in podcast_speakers(count, sp_values)}
+    data = _podcast_data(value)
+    rows = []
+    for b in data["blocks"]:
+        sp = speakers.get(b["speaker"], {})
+        own = not b.get("voice") and sp.get("audio")
+        row = dialogue_row(b["text"], b.get("voice") or sp.get("voice", "None"), b.get("lora") or sp.get("lora", DIALOGUE_INHERIT),
+                           sp.get("audio", "") if own else "", sp.get("ref_text", "") if own else "")
+        if sp.get("pause") is not None:
+            row["pause"] = int(round(sp["pause"] * 1000))
+        row["_speaker"] = b["speaker"]
+        rows.append(row)
+    if not rows:
+        return gr.update(), "No blocks to send.", gr.update(), gr.update()
+    return (dialogue_value(dlg_value, rows, model_version), f"Sent {len(rows)} block(s) to Dialogue.",
+            gr.update(selected="tab_studio"), gr.update(selected="tab_dialogue"))
+
+
+def run_podcast(value, model_version, lora_adapter, temperature, top_p, top_k, max_new_tokens, ras_win_len, ras_max_repeat,
+                seed, reuse_seed, save_to_outputs, chunk_mode, carry_tags, pause_same, pause_other, only_changed, count,
+                *values):
+    sp_values = values[: PODCAST_MAX_SPEAKERS * PODCAST_SPK_FIELDS]
+    adv = advanced_from_values(values[PODCAST_MAX_SPEAKERS * PODCAST_SPK_FIELDS :])
+    adv.only_changed = bool(only_changed)
+    # the podcast's own pauses: between two lines of one speaker, and when the speaker changes
+    adv.pause_same_ms = max(0, int(pause_same or 0))
+    adv.pause_other_ms = max(0, int(pause_other or 0))
+    speakers = {s["name"]: s for s in podcast_speakers(count, sp_values)}
+    data = _podcast_data(value)
+
+    def out(audio=None, file=None, msg=None, bar=None, blocks=None, busy=True):
+        return (gr.update() if audio is None else audio, gr.update() if file is None else file, gr.update() if msg is None else msg,
+                gr.update() if bar is None else bar, gr.update() if blocks is None else blocks,
+                set_button_busy("Voicing…") if busy else restore_button("🎙 Voice the podcast"), gr.update(interactive=busy))
+
+    try:
+        _stop_llm_for_tts()
+        if not adv.asr_check:
+            ASR.unload()
+        blocks = []
+        for b in data["blocks"]:
+            text = (b.get("text") or "").strip()
+            if not text:
+                continue
+            sp = speakers.get(b["speaker"], {"voice": "None", "lora": DIALOGUE_INHERIT})
+            voice = b.get("voice") or sp.get("voice") or "None"
+            lora = b.get("lora") or sp.get("lora") or DIALOGUE_INHERIT
+            lora = lora_adapter if lora == DIALOGUE_INHERIT else lora
+            audio, ref_text = _resolve_reference(None, voice)
+            if not b.get("voice") and sp.get("audio"):  # the speaker's own reference wins over its library voice
+                audio, ref_text, voice = sp["audio"], sp.get("ref_text") or "", "None"
+            blocks.append(Block(text=_finish_sentence(text), ref_audio=audio or None, ref_text=ref_text or "", lora=lora,
+                                speaker=b["speaker"], voice=voice if voice != "None" else "",
+                                pause=sp.get("pause")))  # the speaker's own pause before its lines, or the usual
+        if not blocks:
+            yield out(msg="There are no blocks to voice.", busy=False)
+            return
+        yield out(msg="Preparing…", bar=progress_bar_html(None, "Checking model files"))
+        ready = ensure_tts_for_flow(model_version)
+        sampling = Sampling(model_version=model_version, temperature=max(float(temperature), 0.3), top_p=float(top_p),
+                            top_k=int(top_k), max_frames=int(max_new_tokens), seed=int(seed), reuse_seed=bool(reuse_seed),
+                            chunk_mode=chunk_mode, carry_tags=bool(carry_tags), ras_win_len=int(ras_win_len),
+                            ras_max_repeat=int(ras_max_repeat))
+        wav = results = None
+        elapsed = 0.0
+        for event in render_job(blocks, sampling, adv, 0.15, "podcast"):
+            if event[0] == "progress":
+                yield out(bar=event[1])
+            else:
+                _k, wav, results, elapsed = event
+        report = results_report(results)
+        path = _save_output("Podcast", SAMPLE_RATE, wav, text=" ".join(b.text for b in blocks), reference_name="podcast",
+                            persist=bool(save_to_outputs), adv=adv)
+        notify_done()
+        log(f"{ready}\nPodcast: {len(blocks)} blocks\n{report}\nSaved: {path}")
+        seconds = len(wav) / SAMPLE_RATE
+        yield out(audio=result_audio_value(path), file=path, msg=report, busy=False,
+                  bar=progress_bar_html(100, f"Done · {_fmt_duration(seconds)} of podcast in {_fmt_clock(elapsed)}", "", kind="done"),
+                  blocks=blocks_payload(results, path, "Podcast", blocks))
+    except Cancelled:
+        yield out(msg="Cancelled.", busy=False, bar=progress_bar_html(0, "Cancelled", "", kind="error"))
+    except Exception as exc:
+        log(f"Error: {exc}")
+        yield out(msg=f"❌ {exc}", busy=False, bar=progress_bar_html(0, f"Error: {exc}", "", kind="error"))
+
+
+# ---------------------------------------------------------------- dialogue fixer
+def fixer_transcribe(audio_path, use_sava, *adv_values, progress=gr.Progress(track_tqdm=False)):
+    adv = advanced_from_values(adv_values)
+    if not audio_path:
+        return [], "", "", "Upload or record the audio to fix first."
+    try:
+        _stop_llm_for_tts()
+        progress(0.1, desc="Transcribing with word timings")
+        model = adv.asr_model if adv.asr_model in WHISPER_MODELS else DEFAULT_ASR_MODEL
+        text, words, lang = ASR.transcribe_words(audio_path, model, adv.language)
+        ws = fx.words_from_result(type("R", (), {"words": words})())
+        if use_sava:
+            progress(0.7, desc="Refining word edges with SAVA")
+            from higgs_local.dataset_audio import DatasetAudioProcessor
+
+            audio, sr = fx.load_mono(audio_path)
+            proc = DatasetAudioProcessor()
+            ws = fx.refine_with_sava(ws, audio, sr, proc)
+            proc.unload()
+        transcript = fx.transcript_text(ws)
+        data = [{"text": w.text, "start": round(w.start, 3), "end": round(w.end, 3)} for w in ws]
+        if data:
+            data[0]["lang"] = lang  # the seams are heard later in the same language
+        dur = sf_info_duration(audio_path)
+        return (data, transcript, transcript, f"Transcribed {len(ws)} words ({lang}, {dur:.1f} s). Edit the text below and press Fix.")
+    except Exception as exc:
+        return [], "", "", f"❌ {exc}"
+
+
+def sf_info_duration(path) -> float:
+    import soundfile as _sf
+
+    try:
+        return float(_sf.info(path).duration)
+    except Exception:
+        return 0.0
+
+
+def fixer_plan(words, edited):
+    """What will be voiced again, shown while the transcript is edited (the spans are chosen automatically)."""
+    if not words:
+        return ""
+    ws = [fx.Word(w["text"], float(w["start"]), float(w["end"])) for w in words]
+    patches = fx.find_patches(ws, edited or "")
+    if not patches:
+        return "No change yet: edit the words you want said otherwise."
+    rows = []
+    for p in patches:
+        if not p.after:
+            rows.append(f"- ✂ **{p.before}** is cut out")
+        else:
+            rows.append(f"- 🎙 **{p.before or '…'}** → **{p.after}**")
+    return f"**{len(patches)} change(s)** · each span is grown to a natural cut by itself:\n" + "\n".join(rows)
+
+
+def fixer_run(audio_path, words, edited, match_loud, lora, model_version, temperature, top_p, top_k,
+              max_new_tokens, ras_win_len, ras_max_repeat, seed, reuse_seed, *adv_values):
+    adv = advanced_from_values(adv_values)
+    adv.live = False  # the fixer never streams: the fixed recording plays when it is done
+    AUTOPLAY["on"] = True
+    adv.asr_check = True  # every take is heard: a wrong or repeated word is voiced again
+    adv.retries = max(int(adv.retries or 0), 2)
+    adv.asr_model = adv.asr_model if adv.asr_model in WHISPER_MODELS else DEFAULT_ASR_MODEL
+
+    def out(audio=None, report=None, bar=None, blocks=None, busy=True):
+        return (gr.update() if audio is None else audio, gr.update() if report is None else report,
+                gr.update() if bar is None else bar, gr.update() if blocks is None else blocks,
+                set_button_busy("Fixing…") if busy else restore_button("🩹 Fix the changed words"), gr.update(interactive=busy))
+
+    try:
+        if not audio_path or not words:
+            yield out(report="Transcribe the recording first.", busy=False)
+            return
+        ws = [fx.Word(w["text"], float(w["start"]), float(w["end"])) for w in words]
+        patches = fx.find_patches(ws, edited)  # spans chosen by the recording itself
+        if not patches:
+            yield out(report="Nothing changed in the transcript: edit the words you want said otherwise.", busy=False)
+            return
+        _stop_llm_for_tts()
+        audio, sr = fx.load_mono(audio_path)
+        total = len(audio) / sr
+        FIX = fx.FIX_DIR
+        FIX.mkdir(parents=True, exist_ok=True)
+        blocks = []
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        for k, p in enumerate(patches):
+            p.start, p.end = fx.cut_points(ws, p, total, audio, sr)
+            ref, ref_text = fx.reference_excerpt(audio, sr, ws, p, fx.reference_seconds(ws, p))
+            ref_path = FIX / f"ref_{stamp}_{k}.wav"
+            import soundfile as _sf
+
+            _sf.write(str(ref_path), ref, sr)
+            text = p.after.strip()
+            blocks.append(Block(text=text or "", ref_audio=str(ref_path), ref_text=ref_text, lora=lora or NONE_ADAPTER,
+                                speaker="recording", pause=0.0))
+        speak = [b for b in blocks if b.text]
+        yield out(report=f"{len(patches)} change(s) found; voicing {len(speak)} phrase(s)…", bar=progress_bar_html(None, "Loading the voice"))
+        ensure_tts_for_flow(model_version)
+        sampling = Sampling(model_version=model_version, temperature=max(float(temperature), 0.3), top_p=float(top_p),
+                            top_k=int(top_k), max_frames=int(max_new_tokens), seed=int(seed), reuse_seed=bool(reuse_seed),
+                            chunk_mode="None", carry_tags=False, ras_win_len=int(ras_win_len), ras_max_repeat=int(ras_max_repeat))
+        adv.tidy_pauses = True  # a patch has no silence at its edges: the cut keeps the recording's own pauses
+        adv.level_pieces = False
+        adv.room_tone = False
+        adv.final_loudness = "Off (as the model made it)"
+        results = []
+        if speak:
+            for event in render_job(speak, sampling, adv, 0.15, "fixer"):
+                if event[0] == "progress":
+                    yield out(bar=event[1])
+                else:
+                    _k, _wav, results, _elapsed = event
+        import librosa
+        import soundfile as _sf
+
+        by_block = {id(b): r for b, r in zip(speak, results)}
+        edited_tokens = fx.WORD_RE.findall(edited or "")
+        lang_code = (words[0].get("lang") if words and isinstance(words[0], dict) else None) or ""
+        lang_name = next((n for n, c in WHISPER_LANGS.items() if c == lang_code), adv.language)
+        seam_wav = FIX / f"seam_{stamp}.wav"
+
+        def hear(clip):
+            _sf.write(str(seam_wav), clip, sr)
+            text, _status = ASR.transcribe_whisper_direct(str(seam_wav), adv.asr_model, lang_name)  # in process, model kept
+            return fx.WORD_RE.findall(text or "")
+
+        fixed = audio
+        rows = []
+        for p, b in sorted(zip(patches, blocks), key=lambda pb: -pb[0].start):
+            if b.text:
+                r = by_block[id(b)]
+                new, nsr = _sf.read(r.file, dtype="float32")
+                if new.ndim > 1:
+                    new = new.mean(axis=1)
+                trimmed = []
+                try:  # words said beyond the text at an edge (a reference word said again) are cut off
+                    _t, take_words, _lang = ASR.transcribe_words(r.file, adv.asr_model, lang_name)
+                    t0, t1, trimmed = fx.trim_to_text(fx.words_from_result(type("R", (), {"words": take_words})()),
+                                                      b.text.split(), len(new) / nsr)
+                    log(f"[fixer] take heard: {_t} · trimmed: {trimmed or 'nothing'}")
+                    if trimmed:
+                        new = new[int(t0 * nsr) : int(t1 * nsr)]
+                except Exception as exc:
+                    log(f"[fixer] take check: {exc}")
+                new = render_tidy(new, nsr)
+                if nsr != sr:
+                    new = librosa.resample(new, orig_sr=nsr, target_sr=sr).astype(np.float32)
+                if match_loud:
+                    a0, b0 = int(max(0, p.start - 3) * sr), int(min(total, p.end + 3) * sr)
+                    around = np.concatenate([audio[a0 : int(p.start * sr)], audio[int(p.end * sr) : b0]])
+                    new = fx.match_loudness(new, around)
+                else:  # the take comes at the app's loudness: bring it to the recording's own level
+                    new = fx.match_loudness(new, audio)
+                report = r.report + (f" · trimmed: {' '.join(trimmed)}" if trimmed else "")
+            else:
+                new = np.zeros(0, dtype=np.float32)
+                report = "deleted"
+            fades = fx.seam_fades(ws, p)
+            try:  # the cut points are heard: a word clipped or left over at a seam moves the cut
+                p.start, p.end, errors = fx.best_seams(fixed, sr, ws, p, new, edited_tokens, hear, fades, log=log)
+                if errors:
+                    report += f" · seam: {errors} word(s) unsure"
+            except Cancelled:
+                raise
+            except Exception as exc:
+                log(f"[fixer] seam check: {exc}")
+            fixed = fx.splice(fixed, sr, p.start, p.end, new, *fades)
+            rows.append((p, report, len(new) / sr))
+        del by_block
+        out_path = OUTPUTS_DIR / f"fixed_{Path(audio_path).stem[:60]}_{stamp}.wav"
+        fixed = loudness.normalize(fixed, sr)  # one gain for the whole recording: the app's loudness
+        _sf.write(str(out_path), fixed, sr)
+        notify_done()
+        lines = ["| # | Time | Before | After | Take |", "|---|---|---|---|---|"]
+        for n, (p, report, secs) in enumerate(sorted(rows, key=lambda r: r[0].start), 1):
+            lines.append(f"| {n} | {p.start:.2f}–{p.end:.2f} s → {secs:.2f} s | {p.before or '—'} | {p.after or '— (removed)'} | {report} |")
+        summary = "\n".join(lines) + f"\n\nSaved: `{out_path}`"
+        yield out(audio=result_audio_value(str(out_path)), report=summary, busy=False,
+                  bar=progress_bar_html(100, f"Done · {len(patches)} fix(es)", "", kind="done"),
+                  blocks=[{"file": str(out_path), "text": edited[:120], "speaker": "Fixed", "start": 0.0,
+                           "seconds": len(fixed) / sr, "source": "Fixer"}])
+    except Cancelled:
+        yield out(report="Cancelled.", busy=False, bar=progress_bar_html(0, "Cancelled", "", kind="error"))
+    except Exception as exc:
+        log(f"Error: {exc}")
+        yield out(report=f"❌ {exc}", busy=False, bar=progress_bar_html(0, f"Error: {exc}", "", kind="error"))
+
+
+def render_tidy(x, sr):
+    from higgs_local.render import tidy as _tidy
+
+    return _tidy(np.asarray(x, dtype=np.float32), sr)
+
+
+# ---------------------------------------------------------------- montage
+def montage_send(mode, blocks, value):
+    new_value, note = montage.add_blocks(value, blocks or [], mode)
+    return new_value, gr.update(visible=False), note, gr.update(selected="tab_montage")
+
+
+def montage_export(value, name, fmt):
+    try:
+        path = montage.export(value, name, fmt)
+        notify_done()
+        return fresh_audio_value(path), path, f"Exported: `{path}`"
+    except Exception as exc:
+        return gr.update(), gr.update(), f"❌ {exc}"
+
+
+def montage_save(value, name):
+    try:
+        saved = montage.save_project(name, value)
+        return gr.update(choices=montage.list_saved(), value=saved), f"Saved as **{saved}** in projects/montage."
+    except Exception as exc:
+        return gr.update(), f"❌ {exc}"
+
+
+def montage_load(name):
+    if not name:
+        return gr.update(), "Pick a saved montage."
+    try:
+        return montage.load_project(name), f"Loaded **{name}**."
+    except Exception as exc:
+        return gr.update(), f"❌ {exc}"
+
+
+def montage_new(value):
+    project = montage.empty_project()
+    project["rev"] = int(montage.load_value(value).get("rev", 0)) + 1
+    return montage.dump(project), "New empty timeline."
+
+
+PODCAST_EDITOR_HTML = '<div class="pc-root"></div>'
+
+PODCAST_EDITOR_CSS = r"""
+.pc-root { display:flex; flex-direction:column; gap:6px; }
+.pc-block { display:grid; grid-template-columns: 22px 170px 1fr 34px; gap:6px; align-items:start; padding:6px;
+  border:1px solid var(--border-color-primary); border-radius:8px; background:var(--block-background-fill); }
+.pc-block.drag-over { border-color:var(--color-accent); box-shadow:0 -3px 0 var(--color-accent) inset; }
+.pc-block.dragging { opacity:.45; }
+.pc-grip { cursor:grab; font-size:16px; opacity:.6; padding-top:6px; text-align:center; user-select:none; }
+.pc-side { display:flex; flex-direction:column; gap:4px; }
+.pc-side select, .pc-side input { width:100%; font-size:12px; padding:3px 4px; border-radius:5px; border:1px solid var(--border-color-primary);
+  background:var(--input-background-fill); color:var(--body-text-color); }
+.pc-text { width:100%; min-height:54px; resize:vertical; font-size:13px; padding:6px; border-radius:6px; border:1px solid var(--border-color-primary);
+  background:var(--input-background-fill); color:var(--body-text-color); font-family:inherit; }
+.pc-tools { display:flex; flex-direction:column; gap:3px; }
+.pc-tools button { font-size:12px; padding:2px 0; border-radius:5px; border:1px solid var(--border-color-primary); background:transparent;
+  color:var(--body-text-color); cursor:pointer; }
+.pc-tools button:hover { border-color:var(--color-accent); }
+.pc-n { font-size:10px; opacity:.6; text-align:center; }
+.pc-empty { opacity:.65; padding:14px; border:1px dashed var(--border-color-primary); border-radius:8px; text-align:center; }
+.pc-add { align-self:flex-start; font-size:12px; padding:4px 10px; border-radius:6px; border:1px solid var(--border-color-primary);
+  background:transparent; color:var(--body-text-color); cursor:pointer; }
+"""
+
+PODCAST_EDITOR_JS = r"""
+const root = element.querySelector('.pc-root');
+let D = null, sent = null, dragId = null, timer = null;
+function parse() { try { return JSON.parse(props.value || '{}'); } catch (e) { return {}; } }
+function uid() { return Math.random().toString(16).slice(2, 10); }
+function esc(s) { return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;'); }
+function push(now) {
+  clearTimeout(timer);
+  const go = () => { D.rev = (D.rev || 0) + 1; sent = JSON.stringify(D); props.value = sent; };
+  if (now) go(); else timer = setTimeout(go, 400);
+}
+function opts(list, cur, withDefault) {
+  let h = withDefault ? `<option value="">${withDefault}</option>` : '';
+  for (const o of list) { const [label, val] = Array.isArray(o) ? o : [o, o]; h += `<option value="${esc(val)}"${val === cur ? ' selected' : ''}>${esc(label)}</option>`; }
+  return h;
+}
+function render() {
+  D.blocks = D.blocks || [];
+  const names = (D.speakers || []).map((s) => s.name);
+  if (!D.blocks.length) {
+    root.innerHTML = '<div class="pc-empty">No blocks yet: write a script with the LLM, or add a block.</div><button class="pc-add" data-act="first">＋ Add a block</button>';
+  } else {
+    root.innerHTML = D.blocks.map((b, i) => `
+      <div class="pc-block" draggable="true" data-id="${b.id}">
+        <div><div class="pc-grip" title="Drag to reorder">⠿</div><div class="pc-n">${i + 1}</div></div>
+        <div class="pc-side">
+          <select data-f="speaker" title="Speaker">${opts(names.includes(b.speaker) ? names : [...names, b.speaker], b.speaker)}</select>
+          <select data-f="voice" title="Voice for this block only">${opts((D.voices || []).filter((v) => v !== 'None'), b.voice, 'Voice: speaker’s')}</select>
+          <select data-f="lora" title="LoRA for this block only">${opts((D.loras || []).filter((l) => l[1] !== '__inherit__'), b.lora, 'LoRA: speaker’s')}</select>
+          <input data-f="direction" value="${esc(b.direction)}" placeholder="Direction (tone, pace)">
+        </div>
+        <textarea class="pc-text tag-ac" data-f="text">${esc(b.text)}</textarea>
+        <div class="pc-tools">
+          <button data-act="up" title="Move up">↑</button><button data-act="down" title="Move down">↓</button>
+          <button data-act="add" title="Add a block below">＋</button><button data-act="dup" title="Clone">⧉</button>
+          <button data-act="del" title="Delete">✕</button>
+        </div>
+      </div>`).join('') + '<button class="pc-add" data-act="last">＋ Add a block at the end</button>';
+  }
+  root.querySelectorAll('.pc-text').forEach((t) => { t.style.height = 'auto'; t.style.height = Math.max(54, t.scrollHeight + 2) + 'px'; });
+}
+root.addEventListener('input', (e) => {
+  const el = e.target; const card = el.closest('.pc-block'); if (!card || !el.dataset.f) return;
+  const b = D.blocks.find((x) => x.id === card.dataset.id); if (!b) return;
+  b[el.dataset.f] = el.value;
+  if (el.tagName === 'TEXTAREA') { el.style.height = 'auto'; el.style.height = Math.max(54, el.scrollHeight + 2) + 'px'; }
+  push(el.tagName === 'SELECT');
+});
+root.addEventListener('click', (e) => {
+  const act = e.target.dataset.act; if (!act) return;
+  const card = e.target.closest('.pc-block'); const i = card ? D.blocks.findIndex((x) => x.id === card.dataset.id) : -1;
+  const speaker = (D.speakers || [])[0]?.name || 'Speaker 1';
+  if (act === 'first' || act === 'last') D.blocks.push({ id: uid(), speaker: D.blocks.at(-1)?.speaker || speaker, text: '', direction: '', voice: '', lora: '' });
+  if (act === 'add') D.blocks.splice(i + 1, 0, { ...D.blocks[i], id: uid(), text: '', direction: '' });
+  if (act === 'dup') D.blocks.splice(i + 1, 0, { ...D.blocks[i], id: uid() });
+  if (act === 'del') D.blocks.splice(i, 1);
+  if (act === 'up' && i > 0) [D.blocks[i - 1], D.blocks[i]] = [D.blocks[i], D.blocks[i - 1]];
+  if (act === 'down' && i < D.blocks.length - 1) [D.blocks[i + 1], D.blocks[i]] = [D.blocks[i], D.blocks[i + 1]];
+  render(); push(true);
+});
+root.addEventListener('dragstart', (e) => {
+  const card = e.target.closest?.('.pc-block'); if (!card) return;
+  if (e.target.tagName === 'TEXTAREA' || e.target.tagName === 'INPUT') { e.preventDefault(); return; }
+  dragId = card.dataset.id; card.classList.add('dragging'); e.dataTransfer.effectAllowed = 'move';
+});
+root.addEventListener('dragover', (e) => { const card = e.target.closest('.pc-block'); if (!card || !dragId) return; e.preventDefault();
+  root.querySelectorAll('.drag-over').forEach((c) => c.classList.remove('drag-over')); card.classList.add('drag-over'); });
+root.addEventListener('drop', (e) => {
+  const card = e.target.closest('.pc-block'); if (!card || !dragId) return; e.preventDefault();
+  const from = D.blocks.findIndex((x) => x.id === dragId); let to = D.blocks.findIndex((x) => x.id === card.dataset.id);
+  const [b] = D.blocks.splice(from, 1); if (from < to) to -= 0; D.blocks.splice(to, 0, b);
+  dragId = null; render(); push(true);
+});
+root.addEventListener('dragend', () => { dragId = null; root.querySelectorAll('.dragging,.drag-over').forEach((c) => c.classList.remove('dragging', 'drag-over')); });
+function adopt() {
+  if (props.value === sent && D) return;
+  D = parse(); sent = props.value; render();
+}
+watch('value', adopt);
+adopt();
+"""
+
+
+
+AUTOPLAY = {"on": False}
+
+
+def result_audio_value(path: str):
+    """A finished result: plays by itself when live playback was off (it already played live otherwise)."""
+    return gr.update(value=str(path), visible=True, playback_position=0, autoplay=bool(AUTOPLAY["on"]))
+
+
+def stop_render(label: str):
+    MANAGER.v3.cancel()
+    return restore_button(label), gr.update(interactive=False)
+
+
+def director_bar(title: str, ops: list[str]):
+    with gr.Accordion(title, open=False):
+        with gr.Row(equal_height=True):
+            op = gr.Dropdown([(DIRECTOR_OPS[k], k) for k in ops], value=ops[0], label="LLM operation", scale=2)
+            instruction = gr.Textbox(label="Instruction (optional)", scale=4,
+                                     placeholder="Review: what to fix · Continue: what comes next")
+            btn = gr.Button("🧠 Run", variant="secondary", scale=1, min_width=90)
+        note = gr.Markdown("", elem_classes="hint")
+    return op, instruction, btn, note
+
+
+class Modal:
+    """A modern dialog over the page (the page blurred behind): ``with Modal("Title", "text") as m:`` then the
+    buttons in ``m.actions()``. Show / hide ``m.box`` with ``gr.update(visible=…)``. The button with
+    ``elem_classes=["hv-cancel"]`` is what ✕, a click outside the card and Esc press."""
+
+    def __init__(self, title: str, text: str = ""):
+        self.title, self.text = title, text
+
+    def __enter__(self):
+        import html as _html
+
+        self.box = gr.Column(visible=False, elem_classes=["hv-modal"])
+        self.box.__enter__()
+        self.card = gr.Column(elem_classes=["hv-card"])
+        self.card.__enter__()
+        gr.HTML(f'<div class="hv-head"><div class="hv-title">{_html.escape(self.title)}</div>'
+                '<button class="hv-x" type="button" title="Close (Esc)">✕</button></div>')
+        self.md = gr.Markdown(self.text, elem_classes=["hv-text"])
+        return self
+
+    def actions(self):
+        return gr.Row(elem_classes=["hv-actions"], equal_height=True)
+
+    def __exit__(self, *exc):
+        self.card.__exit__(*exc)
+        self.box.__exit__(*exc)
+        return False
+
+
+def montage_send_bar():
+    send = gr.Button("🎬 Send to montage", variant="secondary", size="sm")
+    with Modal("🎬 Send to the montage",
+               "Add these clips **after the end of the timeline**, or **start a new timeline** with only them "
+               "(the current one is cleared; undo with Ctrl+Z in the timeline).") as m:
+        with m.actions():
+            cancel = gr.Button("Cancel", variant="secondary", elem_classes=["hv-cancel"])
+            replace = gr.Button("♻ Clear and add", variant="secondary", elem_classes=["red-btn"])
+            append = gr.Button("➕ Append to the timeline", variant="primary")
+    note = gr.Markdown("", elem_classes="hint")
+    return send, m.box, append, replace, cancel, note
+
+
+def extras_status() -> str:
+    rows = ["| Component | Status |", "|---|---|"]
+    rows.append(f"| WeSpeaker ResNet34-LM (voice similarity check) | {'✅ installed' if tc.wespeaker_installed() else '⬇ not downloaded (26 MB)'} |")
+    rows.append(f"| llama.cpp server b11900 CUDA (local LLM) | {'✅ installed' if llm.llama_installed() else '⬇ not downloaded (~590 MB)'} |")
+    for m in llm.LOCAL_MODELS:
+        rows.append(f"| {m.label} | {'✅ on disk' if llm.model_installed(m) else '⬇ not downloaded'} |")
+    for p in llm.other_ggufs():
+        rows.append(f"| {p.name} (your GGUF) | ✅ on disk |")
+    from higgs_local.enhance import lava_installed
+
+    rows.append(f"| LavaSR voice enhancer (high frequencies, 48 kHz) | {'✅ installed' if lava_installed() else '⬇ not downloaded (57 MB)'} |")
+    rows.append(f"| Local LLM server | {'🟢 running (uses VRAM)' if llm.SERVER.running else '⚪ stopped'} |")
+    return "\n".join(rows)
+
+
+def _size_of(path: Path) -> int:
+    try:
+        if path.is_file():
+            return path.stat().st_size
+        return sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
+    except OSError:
+        return 0
+
+
+def extras_paths() -> dict:
+    """The extra models on disk, by a readable name."""
+    from higgs_local.enhance import LAVA_DIR
+
+    out: dict = {}
+    if tc.WESPEAKER_PATH.is_file():
+        out["WeSpeaker voice model"] = tc.WESPEAKER_PATH
+    if llm.LLAMA_DIR.is_dir() and any(llm.LLAMA_DIR.iterdir()):
+        out["llama.cpp engine (tools/llama)"] = llm.LLAMA_DIR
+    for m in llm.LOCAL_MODELS:
+        if llm.model_path(m).is_file():
+            out[m.label] = llm.model_path(m)
+    for g in llm.other_ggufs():
+        out[f"{g.name} (your GGUF)"] = g
+    if LAVA_DIR.is_dir():
+        out["LavaSR voice enhancer"] = LAVA_DIR
+    return out
+
+
+def extras_choices():
+    out = []
+    for name, path in extras_paths().items():
+        size = _size_of(path)
+        out.append((f"{name} · {size / 1e9:.2f} GB" if size > 5e8 else f"{name} · {size / 1e6:.0f} MB", name))
+    return out
+
+
+def extras_ask(names):
+    if not names:
+        gr.Warning("Select the extras to delete first.")
+        return gr.update(visible=False), gr.update()
+    paths = extras_paths()
+    lines = [f"- **{n}** · {_size_of(paths[n]) / 1e6:,.0f} MB" for n in names if n in paths]
+    return gr.update(visible=True), ("These are deleted from disk:\n\n" + "\n".join(lines)
+                                     + "\n\nThey download again when a feature needs them.")
+
+
+def extras_delete(names):
+    import shutil
+
+    paths = extras_paths()
+    done, freed = [], 0
+    for name in names or []:
+        path = paths.get(name)
+        if path is None:
+            continue
+        if "llama" in name.lower() or path.suffix == ".gguf":
+            llm.SERVER.stop()
+        if "WeSpeaker" in name:
+            tc.EMBEDDER.unload()
+        if "LavaSR" in name:
+            from higgs_local.enhance import ENHANCER
+
+            ENHANCER.unload()
+        size = _size_of(path)
+        try:
+            shutil.rmtree(path) if path.is_dir() else path.unlink()
+            done.append(name)
+            freed += size
+        except OSError as exc:
+            gr.Warning(f"{name}: {exc}")
+    note = f"\n\n🗑 Deleted {len(done)} item(s), {freed / 1e9:.2f} GB freed: {', '.join(done)}." if done else ""
+    return extras_status() + note, gr.update(choices=extras_choices(), value=[]), gr.update(visible=False)
+
+
+def extras_download(what: str, progress=gr.Progress(track_tqdm=False)):
+    prog = lambda f, d: progress(f or 0.0, desc=d)  # noqa: E731
+    try:
+        if what == "wespeaker":
+            tc.ensure_wespeaker(prog)
+        elif what == "lavasr":
+            from higgs_local.enhance import ensure_lava
+
+            ensure_lava(prog)
+        else:
+            llm.ensure_llama(prog)
+    except Exception as exc:
+        return extras_status() + f"\n\n❌ {exc}"
+    return extras_status()
+
+
+# ---------------------------------------------------------------- GUI presets (every setting and selection)
+GUI_PRESETS_DIR = ROOT / "config" / "gui_presets"
+PRESET_SKIP = re.compile(
+    r"(console|status|_out$|_note$|_md$|^logs?_|_log|report|progress|_file$|result|preset|api_key|_html$|_info$|monitor|"
+    r"^cmd_|^storage|^extras|_tbl$|_pick$|^montage_|confirm|_state$|_blocks$|split_lines|_words)",
+)
+PRESET_HTML = {"dialogue_editor", "pc_editor", "montage_tl"}
+
+
+def collect_preset_components(scope: dict) -> dict:
+    """The GUI's settings and selections by variable name (lists of components get name[i]); each component once."""
+    kinds = (gr.Textbox, gr.Number, gr.Slider, gr.Checkbox, gr.Dropdown, gr.Radio, gr.CheckboxGroup, gr.Audio)
+    out: dict = {}
+    seen: set[int] = set()
+
+    def take(name, obj):
+        if id(obj) in seen or not isinstance(obj, (*kinds, gr.HTML)):
+            return
+        seen.add(id(obj))  # a skipped component stays skipped under any other name
+        if isinstance(obj, gr.HTML):
+            if name in PRESET_HTML:
+                out[name] = obj
+            return
+        if PRESET_SKIP.search(name) or getattr(obj, "interactive", None) is False:
+            return
+        out[name] = obj
+
+    loop_names = {"comp", "pick", "pn", "pm", "pv", "pl", "pa", "pt", "pp", "pse", "psb", "psu", "psn", "s", "t", "a", "lo", "rt", "row", "grp", "btn"}
+    for name, obj in scope.items():
+        if not name.startswith("_") and name not in loop_names and not isinstance(obj, list):
+            take(name, obj)
+    for name, obj in scope.items():
+        if not name.startswith("_") and isinstance(obj, list):
+            for i, o in enumerate(obj):
+                take(f"{name}[{i}]", o)
+    return out
+
+
+def list_gui_presets() -> list[str]:
+    return sorted(p.stem for p in GUI_PRESETS_DIR.glob("*.json")) if GUI_PRESETS_DIR.is_dir() else []
+
+
+def save_gui_preset(names: list[str], name, *values):
+    from higgs_local.audio_utils import safe_name
+
+    name = safe_name((name or "").strip() or "preset", "preset")
+    data = {"version": 1, "saved": time.strftime("%Y-%m-%d %H:%M:%S"), "values": {}}
+    for key, value in zip(names, values):
+        if isinstance(value, (str, int, float, bool, list, dict)) or value is None:
+            data["values"][key] = value
+    GUI_PRESETS_DIR.mkdir(parents=True, exist_ok=True)
+    (GUI_PRESETS_DIR / f"{name}.json").write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+    gr.Info(f"Preset “{name}” saved: {len(data['values'])} settings.")
+    return gr.update(choices=list_gui_presets(), value=name)
+
+
+def _choice_values(comp) -> list:
+    out = []
+    for c in getattr(comp, "choices", None) or []:
+        out.append(c[1] if isinstance(c, (list, tuple)) else c)
+    return out
+
+
+def _looks_like_path(v) -> bool:
+    return isinstance(v, str) and (("/" in v or "\\" in v) and len(v) > 3)
+
+
+def load_gui_preset(names: list[str], comps: list, name):
+    """Every saved setting back in place; whatever is gone (a voice, a LoRA, a file) is skipped and reported."""
+    if not name:
+        gr.Warning("Pick a preset to load.")
+        return [gr.update() for _ in names]
+    path = GUI_PRESETS_DIR / f"{name}.json"
+    try:
+        values = json.loads(path.read_text(encoding="utf-8")).get("values", {})
+    except Exception as exc:
+        gr.Warning(f"The preset “{name}” could not be read: {exc}")
+        return [gr.update() for _ in names]
+    voices = set(list_voice_names())
+    problems: list[str] = []
+    updates = []
+    for key, comp in zip(names, comps):
+        if key not in values:
+            updates.append(gr.update())
+            continue
+        v = values[key]
+        try:
+            if isinstance(comp, gr.HTML):
+                v = _preset_editor_value(key, v, problems)
+            elif isinstance(comp, gr.Audio):
+                if v and not Path(str(v)).is_file():
+                    problems.append(f"{key}: reference audio gone ({Path(str(v)).name})")
+                    v = None
+            elif isinstance(comp, (gr.Dropdown, gr.Radio)):
+                multi = getattr(comp, "multiselect", False)
+                allowed = _choice_values(comp)
+                vals = v if (multi and isinstance(v, list)) else [v]
+                kept = []
+                for x in vals:
+                    ok = (x in allowed or x in (None, "", "None") or getattr(comp, "allow_custom_value", False)
+                          or (x in voices) or (_looks_like_path(x) and Path(str(x)).exists()))
+                    if _looks_like_path(x) and not Path(str(x)).exists():
+                        ok = False
+                    if ok:
+                        kept.append(x)
+                    else:
+                        problems.append(f"{key}: “{Path(str(x)).name if _looks_like_path(x) else x}” is no longer available")
+                if multi:
+                    v = kept
+                elif not kept:
+                    updates.append(gr.update())
+                    continue
+                else:
+                    v = kept[0]
+            elif isinstance(comp, gr.CheckboxGroup):
+                allowed = _choice_values(comp)
+                v = [x for x in (v or []) if x in allowed]
+            updates.append(gr.update(value=v))
+        except Exception as exc:  # one bad value never stops the rest
+            problems.append(f"{key}: {exc}")
+            updates.append(gr.update())
+    if problems:
+        shown = "; ".join(problems[:8]) + (f" … and {len(problems) - 8} more" if len(problems) > 8 else "")
+        gr.Warning(f"Preset “{name}” loaded, with things that are gone kept as they were: {shown}")
+        print(f"[preset] {name}: " + " | ".join(problems), flush=True)
+    else:
+        gr.Info(f"Preset “{name}” loaded.")
+    return updates
+
+
+def _preset_editor_value(key: str, value, problems: list[str]):
+    """A block editor's JSON with missing reference files and voices dropped and fresh lists."""
+    try:
+        data = json.loads(value) if isinstance(value, str) else dict(value or {})
+    except Exception:
+        return gr.update()
+    if key == "montage_tl":  # clips whose audio is gone are dropped
+        data = montage.load_value(json.dumps(data))
+        kept = []
+        for c in data.get("clips", []):
+            if c.get("path") and Path(c["path"]).is_file():
+                kept.append(c)
+            else:
+                problems.append(f"timeline: “{c.get('label') or Path(str(c.get('path') or '')).name}” audio is gone")
+        data["clips"] = kept
+        data.pop("request", None)
+        data.pop("reply", None)
+        data["rev"] = int(data.get("rev", 0)) + 1000
+        return montage.dump(data)
+    voices = set(list_voice_names())
+    rows = data.get("rows") if "rows" in data else data.get("blocks", [])
+    for i, r in enumerate(rows or [], 1):
+        if r.get("audio") and not Path(r["audio"]).is_file():
+            problems.append(f"{key} line {i}: reference audio gone ({r.get('audio_name') or Path(r['audio']).name})")
+            r["audio"] = r["audio_url"] = r["audio_name"] = ""
+        if r.get("voice") and r["voice"] not in voices:
+            problems.append(f"{key} line {i}: voice “{r['voice']}” is gone")
+            r["voice"] = "None" if "rows" in data else ""
+        lora = r.get("lora")
+        if lora and lora not in (DIALOGUE_INHERIT, NONE_ADAPTER, "") and _looks_like_path(lora) and not Path(lora).exists():
+            problems.append(f"{key} line {i}: LoRA gone ({Path(lora).name})")
+            r["lora"] = DIALOGUE_INHERIT if "rows" in data else ""
+    data["rev"] = int(data.get("rev", 0)) + 1000
+    if "rows" in data:
+        return dialogue_value(json.dumps(data))
+    data["voices"] = list_voice_names()
+    return json.dumps(data, ensure_ascii=False)
+
+
+def delete_gui_preset(name):
+    if name and (GUI_PRESETS_DIR / f"{name}.json").is_file():
+        (GUI_PRESETS_DIR / f"{name}.json").unlink()
+        gr.Info(f"Preset “{name}” deleted.")
+    return gr.update(choices=list_gui_presets(), value=None)
+
+
+# ---------------------------------------------------------------- montage: voice a line from the timeline
+MONTAGE_CLIPS_DIR = OUTPUTS_DIR / "montage_clips"
+MONTAGE_MODEL = {"version": "Higgs V3 TTS"}
+
+
+def montage_options(*_args):
+    """Server function for the timeline's line editor: voices, LoRAs and the LLM operations."""
+    return {
+        "voices": list_voice_names(),
+        "loras": [[label, val] for label, val in dialogue_lora_choices(MONTAGE_MODEL["version"])],
+        "ops": [[DIRECTOR_OPS[k], k] for k in ("review", "tags", "punctuate", "continue", "accents")],
+    }
+
+
+def montage_request(value, model_version, lora_adapter, temperature, top_p, top_k, max_new_tokens, ras_win_len, ras_max_repeat,
+                    seed, reuse_seed, chunk_mode, carry_tags, *values):
+    """The timeline asked for something: an LLM edit of a line, or a line voiced (new, or a clip again)."""
+    n_adv = len(ADV_KEYS)
+    adv = advanced_from_values(values[:n_adv])
+    cfg = llm_config_from(values[n_adv:])
+    MONTAGE_MODEL["version"] = model_version or "Higgs V3 TTS"
+    project = montage.load_value(value)
+    req = project.pop("request", None)
+    project.pop("reply", None)
+    if not isinstance(req, dict):
+        yield gr.update(), gr.update()
+        return
+
+    def answer(bar, **reply):
+        project["reply"] = {"id": req.get("id"), **reply}
+        project["rev"] = int(project.get("rev", 0)) + 1
+        return montage.dump(project), bar
+
+    try:
+        if req.get("kind") == "llm":
+            yield gr.update(), progress_bar_html(None, "The LLM is working…")
+            op, text = req.get("op"), (req.get("text") or "").strip()
+            lang = adv.language
+            if op == "continue":
+                context = [(c.get("speaker") or "Speaker", c.get("text") or "") for c in req.get("context") or [] if c.get("text")]
+                me = req.get("voice") if req.get("voice") not in (None, "", "None") else "Speaker"
+                if text:
+                    context.append((me, text))
+                names = list(dict.fromkeys([me, *(s for s, _t in context)]))
+                more = llm.continue_script(cfg, [{"name": n} for n in names], context or [(me, "")], _llm_lang(lang), 0.5,
+                                           req.get("instruction") or "", tag_rules_v3()[0], None, _free_tts_for_llm)
+                mine = [ln["text"] for ln in more if ln.get("speaker") == me] or [more[0]["text"]]
+                new_text = (text + " " + mine[0]).strip() if text else mine[0]
+                yield answer(progress_bar_html(100, "LLM done", "", kind="done"), text=new_text, note="🧠 Continued the line.")
+                return
+            new, refused = director_lines(op, [{"speaker": req.get("voice") or "", "text": text}], req.get("instruction") or "",
+                                          lang, cfg, None)
+            note = _director_note(op, int(new[0] != text), refused, 1)
+            yield answer(progress_bar_html(100, "LLM done", "", kind="done"), text=new[0], note=note)
+            return
+
+        # ---- voice a line
+        text = (req.get("text") or "").strip()
+        voice = req.get("voice") or "None"
+        if voice not in list_voice_names():
+            voice = "None"
+        lora = req.get("lora") or DIALOGUE_INHERIT
+        lora_used = lora_adapter if lora == DIALOGUE_INHERIT else lora
+        if lora_used and lora_used != NONE_ADAPTER and not Path(str(lora_used)).exists():
+            yield answer(gr.update(), error=f"The LoRA is gone: {lora_used}")
+            return
+        _stop_llm_for_tts()
+        audio, ref_text = _resolve_reference(None, voice)
+        own = str(req.get("ref_audio") or "")
+        if own and not Path(own).is_file():
+            yield answer(gr.update(), error="The reference audio is gone: upload it again.")
+            return
+        if own:  # the line's own reference audio wins over the library voice
+            audio, ref_text, voice = own, (req.get("ref_text") or "").strip(), "None"
+        old = next((c for c in project["clips"] if c["id"] == req.get("clip_id")), None)
+        speaker = voice if voice != "None" else (Path(own).stem if own else (old or {}).get("speaker") or "Voice")
+        block = Block(text=_finish_sentence(text), ref_audio=audio or None, ref_text=ref_text or "", lora=lora_used,
+                      speaker=speaker, voice=voice if voice != "None" else "")
+        yield gr.update(), progress_bar_html(None, "Loading the voice")
+        ensure_tts_for_flow(model_version)
+        sampling = Sampling(model_version=model_version, temperature=max(float(temperature), 0.3), top_p=float(top_p),
+                            top_k=int(top_k), max_frames=int(max_new_tokens), seed=int(seed), reuse_seed=bool(reuse_seed),
+                            chunk_mode=chunk_mode, carry_tags=bool(carry_tags), ras_win_len=int(ras_win_len),
+                            ras_max_repeat=int(ras_max_repeat))
+        adv.only_changed = False  # "voice it again" means a new take
+        results = []
+        wav = None
+        for event in render_job([block], sampling, adv, 0.15, "montage"):
+            if event[0] == "progress":
+                yield gr.update(), event[1]
+            else:
+                _k, wav, results, _elapsed = event
+        MONTAGE_CLIPS_DIR.mkdir(parents=True, exist_ok=True)
+        path = MONTAGE_CLIPS_DIR / f"line_{time.strftime('%Y%m%d_%H%M%S')}_{safe_name(text[:40], 'line')}.wav"
+        sr = SAMPLE_RATE
+        if adv.enhance:
+            from higgs_local.enhance import ENHANCER
+
+            wav, sr = ENHANCER.enhance(wav, SAMPLE_RATE, denoise=adv.enhance_denoise)
+        wav = loudness.normalize(wav, sr)
+        import soundfile as _sf
+
+        _sf.write(str(path), np.asarray(wav, dtype=np.float32), sr)
+        dur = round(len(wav) / sr, 4)
+        info = {"path": str(path.resolve()), "url": montage.file_url(str(path)), "label": text[:120], "offset": 0.0, "dur": dur,
+                "src_dur": dur, "text": text, "voice": block.voice, "lora": lora, "speaker": speaker, "source": "timeline",
+                "ref_audio": own, "ref_text": (req.get("ref_text") or "") if own else ""}
+        report = results[0].report if results else ""
+        if old is not None:
+            delta = dur - float(old["dur"])
+            old_end = float(old["start"]) + float(old["dur"])
+            old.update(info)
+            if req.get("ripple") and abs(delta) > 1e-3:
+                for c in project["clips"]:
+                    if c is not old and c["track"] == old["track"] and float(c["start"]) >= old_end - 1e-3:
+                        c["start"] = round(max(0.0, float(c["start"]) + delta), 4)
+            note = f"Voiced again ({dur:.2f} s) · {report}"
+        else:
+            track = req.get("track")
+            if not track or not any(t["id"] == track for t in project["tracks"]):
+                track = montage._voice_track(project, speaker)
+            project["clips"].append({"id": montage._id("c"), "track": track, "start": round(float(req.get("at") or 0.0), 4),
+                                     "gain": 0.0, "fade_in": 0.0, "fade_out": 0.0, **info})
+            note = f"Line added at {float(req.get('at') or 0):.2f} s ({dur:.2f} s) · {report}"
+        notify_done()
+        yield answer(progress_bar_html(100, note, "", kind="done"), done=True, note=note)
+    except Cancelled:
+        yield answer(progress_bar_html(0, "Cancelled", "", kind="error"), error="Cancelled.")
+    except Exception as exc:
+        log(f"Error: {exc}")
+        yield answer(progress_bar_html(0, f"Error: {exc}", "", kind="error"), error=str(exc))
+
+
 def build_ui():
     ensure_local_dirs()
     normalize_voice_library()
@@ -3589,15 +5066,31 @@ def build_ui():
                 gr.HTML(header_html("Higgs Audio Easy GUI"))
         with gr.Row(elem_classes="header-actions"):
             top_unload_btn = gr.Button("⏏ Unload models", size="sm", variant="secondary", scale=0)
-            delete_outputs_btn = gr.Button("🗑 Delete output audios", size="sm", variant="secondary", scale=0, elem_classes=["red-btn"])
-            delete_samples_btn = gr.Button("🗑 Delete reference samples", size="sm", variant="secondary", scale=0, elem_classes=["red-btn"])
             gr.Button("📖 Higgs Audio docs", size="sm", variant="secondary", scale=0, link="https://github.com/boson-ai/higgs-audio")
+            gr.HTML(LIVE_PLAYER_HTML, css_template=LIVE_PLAYER_CSS,
+                    js_on_load=LIVE_PLAYER_JS + "\nwindow.__hvTagOptions = (m) => server.voice_tag_options(m);",
+                    server_functions=[live_poll, voice_tag_options],
+                    elem_id="live-player", scale=0, min_width=220)
+            top_live = gr.Checkbox(value=True, label="📡 Live", container=False, scale=0, min_width=90,
+                                   elem_classes=["top-live"],
+                                   info=None)
+            gui_preset_select = gr.Dropdown(list_gui_presets(), value=None, allow_custom_value=True, show_label=False,
+                                            container=False, scale=0, min_width=220, elem_classes=["gui-preset-select"],
+                                            info=None, label="GUI preset")
+            gui_preset_load_btn = gr.Button("📂 Load preset", size="sm", variant="secondary", scale=0)
+            gui_preset_save_btn = gr.Button("💾 Save preset", size="sm", variant="secondary", scale=0)
+            gui_preset_delete_btn = gr.Button("🗑", size="sm", variant="secondary", scale=0, elem_classes=["red-btn"])
+        with Modal("⚠️ Are you sure?") as danger:
+            with danger.actions():
+                danger_cancel = gr.Button("Cancel", variant="secondary", elem_classes=["hv-cancel"])
+                danger_ok = gr.Button("🗑 Yes, delete", variant="stop")
+        danger_kind = gr.State("")
 
-        with gr.Tabs(elem_classes="main-tabs", selected="tab_studio"):
+        with gr.Tabs(elem_classes="main-tabs", selected="tab_studio") as main_tabs:
             # ================================================================ STUDIO
             with gr.Tab("🎙️ Inference", id="tab_studio"):
-                with gr.Tabs():
-                    with gr.Tab("Single voice"):
+                with gr.Tabs(selected="tab_single") as studio_tabs:
+                    with gr.Tab("Single voice", id="tab_single"):
                         with gr.Row(equal_height=False, elem_classes="studio-grid"):
                             # ---------------- left: script + output
                             with gr.Column(scale=7, min_width=420, elem_classes="studio-main"):
@@ -3609,7 +5102,9 @@ def build_ui():
                                             "Type or paste what the voice should say. Long texts are fine: they are split "
                                             "into natural segments and joined into one continuous take.\n\n"
                                             "Tip: type @ anywhere to insert a tag (emotion, style, prosody, sound effect) "
-                                            "supported by the selected model."
+                                            "supported by the selected model, a library voice {voice:name} or a LoRA "
+                                            "{lora:name}: several speakers in one text. {pause:800} sets the silence "
+                                            "before what follows."
                                         ),
                                         lines=10,
                                         max_lines=30,
@@ -3634,9 +5129,14 @@ def build_ui():
                                             elem_classes="button-stop",
                                             interactive=False,
                                         )
+                                    infer_dir_op, infer_dir_instr, infer_dir_btn, infer_dir_note = director_bar(
+                                        "🧠 LLM director: review, tags, pauses, continue, split direct speech, accents",
+                                        ["review", "tags", "punctuate", "continue", "split", "accents"])
+                                    infer_split_lines = gr.State([])
                                 with gr.Column(elem_classes=["card", "output-card"]):
                                     gr.HTML(section("Output"))
                                     infer_progress = gr.HTML(IDLE_PROGRESS_HTML, elem_classes=["progress-card"])
+                                    infer_blocks = gr.State([])
                                     infer_audio_out = gr.Audio(
                                         label="Result",
                                         type="filepath",
@@ -3657,6 +5157,7 @@ def build_ui():
                                             scale=1,
                                             min_width=140,
                                         )
+                                    infer_send = montage_send_bar()
                                 with gr.Accordion("✨ Control tokens & languages", open=False):
                                     with gr.Row():
                                         with gr.Column():
@@ -3709,6 +5210,16 @@ def build_ui():
                                     sources=["upload", "microphone"],
                                     elem_classes=["audio-safe-space"],
                                 )
+                                with gr.Accordion("🎧 Separate the voice (music, noise, other voices)", open=False):
+                                    with gr.Row(equal_height=True):
+                                        infer_clean_engine = gr.Dropdown(REF_CLEAN_ENGINES, value="voc_fv7+gabox_denoise",
+                                                                          label="Separation model or chain", scale=5)
+                                        infer_clean_btn = gr.Button("🎧 Separate", variant="secondary", scale=1, min_width=110)
+                                        infer_clean_undo = gr.Button("↩ Original", variant="secondary", scale=1, min_width=100)
+                                    infer_clean_note = gr.Markdown(
+                                        "Keeps only the voice of the reference above. RoFormer models download once "
+                                        "(~0.2–0.9 GB each); the cleaned clip replaces the reference.", elem_classes="hint")
+                                    infer_clean_orig = gr.State(None)
                                 infer_ref_text = gr.Textbox(
                                     label="Reference transcript",
                                     placeholder="Loaded from the sample library, editable. Transcribe only when needed.",
@@ -3738,112 +5249,6 @@ def build_ui():
 
                             with gr.Column(min_width=320, elem_classes=["card", "studio-settings"]):
                                 gr.HTML(section("Settings"))
-                                with gr.Accordion("📏 Long text & seed", open=True):
-                                    infer_chunk_mode = gr.Dropdown(
-                                        CHUNK_CHOICES,
-                                        value=SEAMLESS_MODE,
-                                        label="Long text mode",
-                                        info="Seamless splits at sentences (~300 chars, the size Higgs V3 reads reliably) and joins them into one continuous take.",
-                                    )
-                                    with gr.Row(equal_height=True):
-                                        infer_seed = gr.Number(
-                                            value=-1,
-                                            precision=0,
-                                            label="Seed (-1 = random)",
-                                            scale=2,
-                                        )
-                                        use_last_seed_btn = gr.Button("Use last", variant="secondary", scale=1, min_width=90)
-                                        restore_random_seed_btn = gr.Button("Random", variant="secondary", scale=1, min_width=90)
-                                    infer_reuse_chunk_seed = gr.Checkbox(
-                                        label="Reuse one seed across segments",
-                                        value=True,
-                                        info="Keeps the voice steadier when the text is split.",
-                                    )
-                                    infer_carry_tags = gr.Checkbox(
-                                        label="Carry tags across segments",
-                                        value=True,
-                                        info="Repeats the sentence-level V3 tags (emotion, style, speed, pitch...) on the next "
-                                        "segments so the intonation doesn't reset after a split. New tags add up.",
-                                    )
-                                    with gr.Accordion("How the split modes work", open=False):
-                                        gr.Markdown(chunk_mode_reference_text())
-                                with gr.Accordion("🎛️ Sampling", open=False):
-                                    with gr.Row():
-                                        infer_temperature = gr.Slider(
-                                            0.3,
-                                            2.0,
-                                            value=1.0,
-                                            step=0.05,
-                                            label="Temperature",
-                                            info="Lower = steadier, higher = more expressive (and more artifacts).",
-                                        )
-                                        infer_top_p = gr.Slider(
-                                            0.1,
-                                            1.0,
-                                            value=0.95,
-                                            step=0.01,
-                                            label="Top-p",
-                                            info="Nucleus cutoff. Lower constrains style and pronunciation.",
-                                        )
-                                    with gr.Row():
-                                        infer_top_k = gr.Slider(
-                                            0,
-                                            200,
-                                            value=50,
-                                            step=1,
-                                            label="Top-k",
-                                            info="0 disables. 30–80 is a practical range.",
-                                        )
-                                        infer_max_new = gr.Slider(
-                                            128,
-                                            8192,
-                                            value=4096,
-                                            step=128,
-                                            label="Max frames per pass",
-                                            info="Safety cap per segment (25 frames = 1 s).",
-                                        )
-                                    with gr.Row():
-                                        infer_ras_win_len = gr.Slider(
-                                            0,
-                                            32,
-                                            value=7,
-                                            step=1,
-                                            label="V2 RAS window",
-                                            info="V2 only. 0 disables repetition-aware sampling.",
-                                        )
-                                        infer_ras_max_repeat = gr.Slider(
-                                            1,
-                                            8,
-                                            value=2,
-                                            step=1,
-                                            label="V2 RAS max repeats",
-                                            info="V2 only. 1 = strongest anti-loop.",
-                                        )
-                                with gr.Accordion("⚗️ Runtime", open=False):
-                                    v3_precision = gr.Dropdown(
-                                        [
-                                            ("Auto (bf16 · fast engine)", "auto"),
-                                            ("bf16 · 12+ GB VRAM · fast engine", "bf16"),
-                                            ("8-bit · 8+ GB VRAM · compatibility engine", "8bit"),
-                                            ("4-bit · 6+ GB VRAM · compatibility engine", "4bit"),
-                                        ],
-                                        value="auto",
-                                        label="Higgs V3 precision",
-                                        info="bf16 runs on the fast CUDA-graph engine. 8/4-bit use the slower compatibility loop.",
-                                    )
-                                    v3_attention_backend = gr.Dropdown(
-                                        [
-                                            ("SDPA - stable PyTorch attention", "sdpa"),
-                                            ("Eager - compatibility fallback", "eager"),
-                                        ],
-                                        value="sdpa",
-                                        label="Attention backend (compatibility engine)",
-                                    )
-                                    v3_torch_compile = gr.Checkbox(
-                                        label="torch.compile (compatibility engine only)",
-                                        value=saved_v3_compile,
-                                        info="Not needed on the fast engine. First run can take minutes to compile.",
-                                    )
                                 with gr.Accordion("🛰️ Transcription (ASR)", open=False):
                                     infer_asr_model = gr.Dropdown(
                                         label="ASR model",
@@ -3856,46 +5261,30 @@ def build_ui():
                                         value="Auto-detect",
                                     )
 
-                    with gr.Tab("Dialogue"):
+                    with gr.Tab("Dialogue", id="tab_dialogue"):
                         with gr.Column(elem_classes="card"):
                             gr.HTML(section("Multi-speaker dialogue"))
-                            speaker_inputs = []
-                            dialogue_rows = []
-                            dialogue_add_btns = []
-                            dialogue_copy_btns = []
-                            dialogue_delete_btns = []
-                            dialogue_row_count = gr.State(2)
+                            gr.Markdown(
+                                "Add as many lines as you need. Each line has its own voice: a library voice or its own "
+                                "reference audio (uploading one wins), and its own LoRA. Drag ⠿ to reorder; ＋ adds a line below "
+                                "with the same voice and LoRA, ⧉ clones it, ✕ deletes it. Type @ in a line for tags. "
+                                "Pauses between lines are in ⚙️ Advanced speech settings → Pauses.",
+                                elem_classes="hint",
+                            )
+                            dialogue_lora_init = dialogue_lora_choices("Higgs V3 TTS")
+                            dialogue_editor = gr.HTML(
+                                dialogue_value("{}", [dialogue_row("", default_sample_name), dialogue_row("", default_sample_name)],
+                                               "Higgs V3 TTS", default_sample_name),
+                                html_template=DIALOGUE_EDITOR_HTML, css_template=DIALOGUE_EDITOR_CSS, js_on_load=DIALOGUE_EDITOR_JS,
+                                server_functions=[separate_ref_server], elem_id="dialogue-editor",
+                            )
                             with gr.Row():
-                                dialogue_reset_btn = gr.Button("Reset rows", size="sm", variant="secondary")
-                                dialogue_clear_btn = gr.Button("Clear rows", size="sm", variant="secondary")
-                                dialogue_compact_btn = gr.Button("Remove empty rows", size="sm", variant="secondary")
-                            for i in range(DIALOGUE_MAX_SEGMENTS):
-                                with gr.Row(visible=i < 2, equal_height=True) as row:
-                                    with gr.Column(scale=3, min_width=180):
-                                        s = gr.Dropdown(
-                                            choices=list_voice_names(),
-                                            label=f"Speaker {i + 1}",
-                                            value=default_sample_name if i < 2 else "None",
-                                        )
-                                    t = gr.Textbox(
-                                        placeholder=f"What speaker {i + 1} says...",
-                                        label=f"Line {i + 1}",
-                                        scale=7,
-                                        lines=3,
-                                        elem_classes=["tag-ac"],
-                                    )
-                                    with gr.Column(scale=1, min_width=64):
-                                        add_btn = gr.Button("＋", variant="secondary", size="sm", elem_classes=["green-btn"])
-                                        copy_btn = gr.Button("⧉", variant="secondary", size="sm")
-                                        delete_btn = gr.Button("✕", variant="secondary", size="sm", elem_classes=["red-btn"])
-                                    a = gr.Audio(label=f"Reference {i + 1}", type="filepath", visible=False, elem_classes=["audio-safe-space"])
-                                    rt = gr.Textbox(label=f"Reference Text {i + 1}", visible=False)
-                                    speaker_inputs.extend([t, s, a, rt])
-                                    dialogue_rows.append(row)
-                                    dialogue_add_btns.append(add_btn)
-                                    dialogue_copy_btns.append(copy_btn)
-                                    dialogue_delete_btns.append(delete_btn)
-                            dialogue_silence_slider = gr.Slider(0, 5, value=0.5, step=0.1, label="Silence between speakers (s)")
+                                dialogue_refresh_lora_btn = gr.Button("🔄 Refresh LoRA lists", size="sm", variant="secondary")
+                            dlg_dir_op, dlg_dir_instr, dlg_dir_btn, dlg_dir_note = director_bar(
+                                "🧠 LLM director: review, tags, pauses, continue, accents",
+                                ["review", "tags", "punctuate", "continue", "accents"])
+                            dlg_only_changed = gr.Checkbox(label="♻ Voice only what changed", value=False,
+                                                           info="Every line's take is kept by its text, voice, LoRA and sampling: after an edit only the changed lines are voiced again, the rest is reused. Off: everything is voiced again.")
                             with gr.Row(equal_height=True):
                                 dialogue_gen_btn = gr.Button(
                                     "⚡ Generate Dialogue",
@@ -3915,6 +5304,8 @@ def build_ui():
                                 )
                         with gr.Column(elem_classes=["card", "output-card"]):
                             gr.HTML(section("Output"))
+                            dialogue_progress = gr.HTML(IDLE_PROGRESS_HTML, elem_classes=["progress-card"])
+                            dialogue_blocks = gr.State([])
                             dialogue_audio_out = gr.Audio(
                                 label="Generated dialogue",
                                 type="filepath",
@@ -3922,13 +5313,172 @@ def build_ui():
                                 elem_classes=["audio-safe-space", "output-clean"],
                             )
                             dialogue_file_out = gr.Textbox(label="Saved WAV", interactive=False, elem_classes=["output-path"])
+                            dialogue_send = montage_send_bar()
                         gr.Markdown(
-                            "Uses the model, LoRA, sampling, long-text mode and *Carry tags across segments* settings from **Single voice** "
-                            "(tags carry between the chunks of one line; each line keeps its own tags).",
+                            "Uses the model and the Single voice LoRA (for turns set to *Same as Single voice*); sampling, long-text mode, checks and pauses "
+                            "come from ⚙️ Advanced speech settings (tags carry between the chunks of one line; each line keeps its own tags).",
                             elem_classes="hint",
                         )
 
                 infer_console = gr.Textbox(label="Internal Status", lines=1, interactive=False, value="Idle.", visible=False)
+
+            # ================================================================ PODCAST
+            with gr.Tab("🎙 Podcast (LLM)", id="tab_podcast"):
+                with gr.Row(equal_height=False):
+                    with gr.Column(scale=4, min_width=320, elem_classes="card"):
+                        gr.HTML(section("Topic & cast"))
+                        pc_topic = gr.Textbox(label="Topic or prompt", lines=4,
+                                              placeholder="What the conversation is about, its angle, facts to include…")
+                        with gr.Row(equal_height=True):
+                            pc_language = gr.Dropdown(PODCAST_LANGS, value="auto", label="Language", allow_custom_value=True, min_width=90)
+                            pc_minutes = gr.Slider(0.5, 30, value=3, step=0.5, label="Length (minutes)")
+                            pc_count = gr.Slider(1, PODCAST_MAX_SPEAKERS, value=2, step=1, label="Speakers")
+                        pc_speaker_inputs = []
+                        pc_speaker_rows = []
+                        pc_sep_parts = []
+                        _pc_names = ["Host", "Guest", "Speaker 3", "Speaker 4", "Speaker 5", "Speaker 6"]
+                        _pc_voices = [v for v in list_voice_names() if v != "None"]
+                        for i in range(PODCAST_MAX_SPEAKERS):
+                            with gr.Group(visible=i < 2) as grp:
+                                with gr.Row(equal_height=True):
+                                    pn = gr.Textbox(value=_pc_names[i], label=f"Speaker {i + 1} · name", scale=2)
+                                    pm = gr.Textbox(label="Manner / character", placeholder="curious host, warm, quick", scale=3)
+                                with gr.Row(equal_height=True):
+                                    pv = gr.Dropdown(list_voice_names(), value=_pc_voices[i] if i < len(_pc_voices) else "None",
+                                                     label="Voice", scale=2)
+                                    pl = gr.Dropdown(dialogue_lora_init, value=DIALOGUE_INHERIT, label="LoRA", scale=2)
+                                    pp = gr.Number(value=None, precision=0, minimum=0, maximum=30000, scale=1, min_width=110,
+                                                   label="Pause before (ms)", placeholder="auto",
+                                                   info="Before each line of this speaker; empty: the podcast pauses.")
+                                with gr.Accordion("🎙 Own reference audio (optional, wins over the library voice)", open=False):
+                                    pa = gr.Audio(label="Reference audio · 5–30 s", type="filepath",
+                                                  sources=["upload", "microphone"], elem_classes=["audio-safe-space"])
+                                    pt = gr.Textbox(label="Reference transcript", lines=1,
+                                                    placeholder="What the reference says (empty: no transcript)")
+                                    with gr.Row(equal_height=True):
+                                        pse = gr.Dropdown(REF_CLEAN_ENGINES, value="voc_fv7+gabox_denoise", scale=5,
+                                                          label="🎧 Separate the voice from music, noise or other voices")
+                                        psb = gr.Button("🎧 Separate", variant="secondary", scale=1, min_width=110)
+                                        psu = gr.Button("↩ Original", variant="secondary", scale=1, min_width=100)
+                                    psn = gr.Markdown("", elem_classes="hint")
+                                    pc_sep_parts.append((pa, pse, psb, psu, gr.State(None), psn))
+                            pc_speaker_inputs.extend([pn, pm, pv, pl, pa, pt, pp])
+                            pc_speaker_rows.append(grp)
+                        with gr.Row():
+                            pc_write_btn = gr.Button("✍ Write the script", variant="primary")
+                            pc_clear_btn = gr.Button("🧹 Clear blocks", variant="secondary")
+                        pc_direction = gr.Textbox(label="What comes next (for Continue)",
+                                                  placeholder="e.g. they disagree about the price, then wrap up")
+                        with gr.Row():
+                            pc_continue_btn = gr.Button("➕ Continue from the last block", variant="secondary")
+                        pc_note = gr.Markdown("", elem_classes="hint")
+                        pc_dir_op, pc_dir_instr, pc_dir_btn, pc_dir_note = director_bar(
+                            "🧠 LLM director: review, tags, pauses, accents", ["review", "tags", "punctuate", "accents"])
+                    with gr.Column(scale=7, min_width=420):
+                        with gr.Column(elem_classes="card"):
+                            gr.HTML(section("Script blocks"))
+                            gr.Markdown("Drag ⠿ (or ↑ ↓) to reorder, edit any text, pick another speaker; a block can override its "
+                                        "speaker's voice and LoRA. ＋ adds a block below, ⧉ clones it, ✕ deletes it. Type @ for tags.",
+                                        elem_classes="hint")
+                            pc_editor = gr.HTML(
+                                podcast_value("{}", podcast_speakers(2, ["Host", "", "None", DIALOGUE_INHERIT, None, "", None,
+                                                                         "Guest", "", "None", DIALOGUE_INHERIT, None, "", None]), []),
+                                html_template=PODCAST_EDITOR_HTML, css_template=PODCAST_EDITOR_CSS, js_on_load=PODCAST_EDITOR_JS,
+                                elem_id="podcast-editor")
+                            with gr.Row(equal_height=True):
+                                pc_gen_btn = gr.Button("🎙 Voice the podcast", variant="primary", size="lg", scale=5,
+                                                       elem_classes="button-primary")
+                                pc_stop_btn = gr.Button("⏹ Stop", variant="stop", size="lg", scale=1, min_width=96,
+                                                        elem_classes="button-stop", interactive=False)
+                                pc_to_dialogue_btn = gr.Button("➡ Send to Dialogue", variant="secondary", scale=1, min_width=150)
+                            with gr.Row(equal_height=True):
+                                pc_pause_same = gr.Number(value=300, precision=0, minimum=0, maximum=10000,
+                                                          label="Pause between lines of one speaker (ms)")
+                                pc_pause_other = gr.Number(value=700, precision=0, minimum=0, maximum=10000,
+                                                           label="Pause when the speaker changes (ms)")
+                            pc_only_changed = gr.Checkbox(label="♻ Voice only what changed", value=False,
+                                                          info="Every line's take is kept by its text, voice, LoRA and sampling: after an edit only the changed lines are voiced again, the rest is reused. Off: everything is voiced again.")
+                        with gr.Column(elem_classes=["card", "output-card"]):
+                            gr.HTML(section("Output"))
+                            pc_progress = gr.HTML(IDLE_PROGRESS_HTML, elem_classes=["progress-card"])
+                            pc_blocks = gr.State([])
+                            pc_audio_out = gr.Audio(label="Podcast", type="filepath", elem_classes=["audio-safe-space", "output-clean"])
+                            pc_file_out = gr.Textbox(label="Saved WAV", interactive=False, elem_classes=["output-path"])
+                            pc_report = gr.Markdown("")
+                            pc_send = montage_send_bar()
+
+            # ================================================================ MONTAGE
+            with gr.Tab("🎬 Montage", id="tab_montage"):
+                with gr.Column(elem_classes="card"):
+                    gr.HTML(section("Timeline"))
+                    gr.Markdown(
+                        "Space plays/stops · click, Ctrl/Shift+click or drag a box to select · Del deletes · drag a clip to move it "
+                        "(also to another track), drag its edges to trim · S splits at the playhead · wheel zooms, Shift+wheel "
+                        "scrolls · right-click for fades, gain and more · Ctrl+Z/Y undo/redo · drop audio files to import.",
+                        elem_classes="hint")
+                    montage_tl = gr.HTML(montage.initial_value(), html_template=montage.MONTAGE_HTML,
+                                         css_template=montage.MONTAGE_CSS, js_on_load=montage.MONTAGE_JS,
+                                         server_functions=[montage.montage_probe, montage_options, separate_ref_server],
+                                         elem_id="montage-timeline")
+                    montage_progress = gr.HTML(IDLE_PROGRESS_HTML, elem_classes=["progress-card"])
+                with gr.Row(equal_height=False):
+                    with gr.Column(elem_classes="card"):
+                        gr.HTML(section("Project"))
+                        with gr.Row(equal_height=True):
+                            montage_name = gr.Textbox(label="Name", value="montage", scale=3)
+                            montage_save_btn = gr.Button("💾 Save", variant="secondary", scale=1)
+                        with gr.Row(equal_height=True):
+                            montage_saved = gr.Dropdown(montage.list_saved(), value=None, label="Saved montages", scale=3)
+                            montage_load_btn = gr.Button("📂 Load", variant="secondary", scale=1)
+                            montage_new_btn = gr.Button("🆕 New", variant="secondary", scale=1, elem_classes=["red-btn"])
+                        montage_note = gr.Markdown("")
+                    with gr.Column(elem_classes=["card", "output-card"]):
+                        gr.HTML(section("Export"))
+                        with gr.Row(equal_height=True):
+                            montage_fmt = gr.Dropdown(["44.1 kHz stereo WAV", "48 kHz stereo WAV", "24 kHz mono WAV"],
+                                                      value="44.1 kHz stereo WAV", label="Format", scale=3)
+                            montage_export_btn = gr.Button("⬇ Export the mix", variant="primary", scale=1)
+                        montage_audio = gr.Audio(label="Mix", type="filepath", elem_classes=["audio-safe-space", "output-clean"])
+                        montage_file = gr.Textbox(label="Exported file", interactive=False, elem_classes=["output-path"])
+
+            # ================================================================ FIXER
+            with gr.Tab("🩹 Dialogue Fixer", id="tab_fixer"):
+                with gr.Row(equal_height=False):
+                    with gr.Column(scale=5, min_width=380, elem_classes="card"):
+                        gr.HTML(section("Recording"))
+                        gr.Markdown(
+                            "Import a recording, transcribe it with word timings, then edit the words you want said otherwise. "
+                            "Only the changed words, grown to the nearest natural cut, are voiced again with the recording "
+                            "itself as the voice reference; every seam is checked by ear (Descript-style). Delete words to cut them.",
+                            elem_classes="hint")
+                        fx_audio = gr.Audio(label="Recording to fix", type="filepath", sources=["upload", "microphone"],
+                                            elem_classes=["audio-safe-space"])
+                        with gr.Row(equal_height=True):
+                            fx_sava = gr.Checkbox(value=True, label="Refine word edges with SAVA (voice activity)")
+                            fx_transcribe_btn = gr.Button("🎙 Transcribe with word timings", variant="secondary")
+                        fx_words_state = gr.State([])
+                        fx_original = gr.Textbox(label="Transcript (as recorded)", lines=3, interactive=False)
+                        fx_edited = gr.Textbox(label="Edited transcript · change the words to fix", lines=5, elem_classes=["tag-ac"])
+                        fx_note = gr.Markdown("", elem_classes="hint")
+                        fx_plan = gr.Markdown("", elem_classes="hint")
+                    with gr.Column(scale=4, min_width=320, elem_classes="card"):
+                        gr.HTML(section("Fix"))
+                        fx_lora = gr.Dropdown(dialogue_lora_init[1:], value=NONE_ADAPTER, label="LoRA (optional)")
+                        fx_match = gr.Checkbox(value=True, label="Match loudness to the speech around")
+                        gr.Markdown("Everything else is automatic: each change grows to the nearest pause or punctuation "
+                                    "of the recording (the pace of this speaker sets what a pause is), the voice is "
+                                    "cloned from the speech around it, every take is heard and words said twice at a "
+                                    "seam are cut off, and the crossfades fit the gap at each cut.", elem_classes="hint")
+                        with gr.Row(equal_height=True):
+                            fx_run_btn = gr.Button("🩹 Fix the changed words", variant="primary", size="lg", scale=5,
+                                                   elem_classes="button-primary")
+                            fx_stop_btn = gr.Button("⏹ Stop", variant="stop", size="lg", scale=1, min_width=96,
+                                                    elem_classes="button-stop", interactive=False)
+                        fx_progress = gr.HTML(IDLE_PROGRESS_HTML, elem_classes=["progress-card"])
+                        fx_audio_out = gr.Audio(label="Fixed recording", type="filepath", elem_classes=["audio-safe-space", "output-clean"])
+                        fx_report = gr.Markdown("")
+                        fx_blocks = gr.State([])
+                        fx_send = montage_send_bar()
 
             # ========================================================= VOICE LIBRARY
             with gr.Tab("📚 Voice Library", id="tab_prep_samples"):
@@ -3959,6 +5509,16 @@ def build_ui():
                             sources=["upload", "microphone"],
                             elem_classes=["audio-safe-space"],
                         )
+                        with gr.Row(equal_height=True):
+                            prep_clean_engine = gr.Dropdown(REF_CLEAN_ENGINES, value="voc_fv7+gabox_denoise",
+                                                            label="🎧 Separate the voice from music, noise or other voices",
+                                                            scale=5)
+                            prep_clean_btn = gr.Button("🎧 Separate", variant="secondary", scale=1, min_width=110)
+                            prep_clean_undo = gr.Button("↩ Original", variant="secondary", scale=1, min_width=100)
+                        prep_clean_note = gr.Markdown("Clean the clip before saving it: the saved sample is the cleaned "
+                                                      "audio. RoFormer models download once (~0.2–0.9 GB each).",
+                                                      elem_classes="hint")
+                        prep_clean_orig = gr.State(None)
                         prep_transcription = gr.Textbox(
                             label="Transcript",
                             placeholder="Transcription will appear here, or type it manually...",
@@ -4105,7 +5665,7 @@ def build_ui():
                                 label="Drop clips with less speech than",
                                 info="Share of the clip with detected voice. 0 = keep all; 0.3–0.5 drops music/noise-only clips.",
                             )
-                            ready_normalize = gr.Checkbox(label="Normalize loudness (-20 LUFS)", value=True)
+                            ready_normalize = gr.Checkbox(label="Normalize loudness (the app's loudness, −20 LUFS by default)", value=True)
                         with gr.Row():
                             dataset_align = gr.Checkbox(
                                 label="Align text to audio (Qwen3-ForcedAligner)",
@@ -4152,8 +5712,9 @@ def build_ui():
                             train_open_btn = gr.Button("📂", scale=1, min_width=50)
                         train_model_select = gr.Dropdown(TRAINING_MODEL_CHOICES, value="Higgs V3 TTS", label="Base Model")
                         initial_datasets = list_train_datasets()
-                        train_manifest = gr.Dropdown(choices=initial_datasets, label="Train Dataset Directory")
-                        val_manifest = gr.Dropdown(choices=[""] + initial_datasets, label="Validation Dataset Directory")
+                        # nothing is picked until a project (or the user) picks it
+                        train_manifest = gr.Dropdown(choices=initial_datasets, value=None, label="Train Dataset Directory")
+                        val_manifest = gr.Dropdown(choices=[""] + initial_datasets, value="", label="Validation Dataset Directory")
                         with gr.Row():
                             refresh_train_btn = gr.Button("🔄 Refresh Datasets", size="sm")
                             auto_tune_btn = gr.Button("🧠 Analyze & Auto-tune", size="sm")
@@ -4252,6 +5813,11 @@ def build_ui():
                             label="Final adapter = best eval", value=True,
                             info="When training ends or stops, the exported LoRA is the best-eval checkpoint.",
                         )
+                        v3_best_only = gr.Checkbox(
+                            label="Keep only the best adapter (saves space, not resumable)", value=False,
+                            info="No numbered checkpoints or optimizer state are written: when the run ends, the final LoRA is "
+                            "the best-eval adapter (a few MB) and nothing else stays. The run cannot be resumed.",
+                        )
                         v3_max_batch_sec = gr.Number(
                             value=40, precision=0, label="Max audio per micro-batch (s)",
                             info="Caps padded audio per batch to avoid out-of-memory with long clips.",
@@ -4270,6 +5836,7 @@ def build_ui():
                         lines=3,
                         placeholder="Leave empty to use an unseen sentence from the eval set (its real recording is shown as the reference).",
                         value="",
+                        elem_classes=["tag-ac"],
                     )
                     eval_audio_max_new = gr.Number(value=1000, precision=0, label="Eval audio max new tokens")
                 with gr.Row():
@@ -4299,6 +5866,32 @@ def build_ui():
                     "confirmation first; deleted models download again when a feature needs them.",
                     elem_classes="hint",
                 )
+                with gr.Accordion("🧹 Output audios & voice library", open=False, elem_classes="accordion"):
+                    gr.Markdown("Empty the **outputs** folder (every generated audio, the timeline's voiced lines and the "
+                                "separated voices) or the **voice library** (every sample with its transcript). "
+                                "Both ask first.", elem_classes="hint")
+                    with gr.Row(equal_height=True):
+                        delete_outputs_btn = gr.Button("🗑 Delete output audios", variant="secondary", elem_classes=["red-btn"])
+                        delete_samples_btn = gr.Button("🗑 Delete reference samples", variant="secondary", elem_classes=["red-btn"])
+                with gr.Accordion("📦 Extra models · downloads, status & cleanup", open=False, elem_classes="accordion"):
+                    extras_md = gr.Markdown(extras_status())
+                    with gr.Row(equal_height=True):
+                        extras_refresh_btn = gr.Button("🔄 Refresh", size="sm", variant="secondary")
+                        extras_wespeaker_btn = gr.Button("⬇ WeSpeaker voice model", size="sm", variant="secondary")
+                        extras_llama_btn = gr.Button("⬇ llama.cpp engine", size="sm", variant="secondary")
+                        extras_lava_btn = gr.Button("⬇ LavaSR voice enhancer", size="sm", variant="secondary")
+                    with gr.Row(equal_height=True):
+                        extras_pick = gr.Dropdown(extras_choices(), value=[], multiselect=True, label="Installed extras to delete",
+                                                  scale=6)
+                        extras_del_btn = gr.Button("🗑️ Delete selected", variant="stop", scale=1, min_width=150)
+                    with Modal("🗑 Delete extra models") as extras_modal:
+                        with extras_modal.actions():
+                            extras_cancel_btn = gr.Button("Cancel", variant="secondary", elem_classes=["hv-cancel"])
+                            extras_confirm_btn = gr.Button("🗑 Yes, delete", variant="stop")
+                    extras_confirm_row = extras_modal.box
+                    gr.Markdown("LLM models download from ⚙️ Advanced speech settings → 🧠 LLM (⬇ Download / check). "
+                                "Check models (ASR, SAVA) download on first use. Deleting a model that is a hard link "
+                                "to another copy only removes this link.", elem_classes="hint")
                 storage_sections = {}
                 for kind, title in (("models", "🧠 Models & caches"), ("loras", "🧬 LoRA runs"), ("datasets", "📂 Datasets")):
                     with gr.Accordion(title, open=kind == "models", elem_classes="accordion"):
@@ -4321,11 +5914,11 @@ def build_ui():
                                 parts_pick = gr.Dropdown([], value=[], multiselect=True, label="Select checkpoints / folders to delete", scale=6)
                                 parts_del_btn = gr.Button("🗑️ Delete selected", variant="stop", scale=1, min_width=150)
                         storage_pending = gr.State([])
-                        with gr.Group(visible=False) as confirm_group:
-                            confirm_md = gr.Markdown("")
-                            with gr.Row():
-                                confirm_btn = gr.Button("✅ Yes, delete permanently", variant="stop")
-                                cancel_btn = gr.Button("Cancel", variant="secondary")
+                        with Modal("⚠️ Delete permanently") as storage_modal:
+                            with storage_modal.actions():
+                                cancel_btn = gr.Button("Cancel", variant="secondary", elem_classes=["hv-cancel"])
+                                confirm_btn = gr.Button("🗑 Yes, delete permanently", variant="stop")
+                        confirm_group, confirm_md = storage_modal.box, storage_modal.md
                         result_md = gr.Markdown("", elem_classes="hint")
 
                         scan_btn.click(lambda k=kind: storage_view(k), None, [tbl, total_md, pick])
@@ -4393,6 +5986,230 @@ def build_ui():
                         [cmp_status, cmp_results],
                     )
 
+        with gr.Accordion("⚙️ Advanced speech settings · shared by every tab", open=False, elem_classes=["accordion", "advanced-speech"]):
+            with gr.Accordion("📏 Long text & seed", open=False):
+                infer_chunk_mode = gr.Dropdown(
+                    CHUNK_CHOICES,
+                    value=SEAMLESS_MODE,
+                    label="Long text mode",
+                    info="Seamless splits at sentences (~300 chars, the size Higgs V3 reads reliably) and joins them into one continuous take.",
+                )
+                with gr.Row(equal_height=True):
+                    infer_seed = gr.Number(
+                        value=-1,
+                        precision=0,
+                        label="Seed (-1 = random)",
+                        scale=2,
+                    )
+                    use_last_seed_btn = gr.Button("Use last", variant="secondary", scale=1, min_width=90)
+                    restore_random_seed_btn = gr.Button("Random", variant="secondary", scale=1, min_width=90)
+                infer_reuse_chunk_seed = gr.Checkbox(
+                    label="Reuse one seed across segments",
+                    value=True,
+                    info="Keeps the voice steadier when the text is split.",
+                )
+                infer_carry_tags = gr.Checkbox(
+                    label="Carry tags across segments",
+                    value=True,
+                    info="Repeats the sentence-level V3 tags (emotion, style, speed, pitch...) on the next "
+                    "segments so the intonation doesn't reset after a split. New tags add up.",
+                )
+                with gr.Accordion("How the split modes work", open=False):
+                    gr.Markdown(chunk_mode_reference_text())
+            with gr.Accordion("🎛️ Sampling", open=False):
+                with gr.Row():
+                    infer_temperature = gr.Slider(
+                        0.3,
+                        2.0,
+                        value=1.0,
+                        step=0.05,
+                        label="Temperature",
+                        info="Lower = steadier, higher = more expressive (and more artifacts).",
+                    )
+                    infer_top_p = gr.Slider(
+                        0.1,
+                        1.0,
+                        value=0.95,
+                        step=0.01,
+                        label="Top-p",
+                        info="Nucleus cutoff. Lower constrains style and pronunciation.",
+                    )
+                with gr.Row():
+                    infer_top_k = gr.Slider(
+                        0,
+                        200,
+                        value=50,
+                        step=1,
+                        label="Top-k",
+                        info="0 disables. 30–80 is a practical range.",
+                    )
+                    infer_max_new = gr.Slider(
+                        0,
+                        8192,
+                        value=0,
+                        step=64,
+                        label="Max frames per pass (0 = auto)",
+                        info="Safety cap per segment (25 frames = 1 s). Auto ends a take a second past the longest its text can last, so a runaway take stops early.",
+                    )
+                with gr.Row():
+                    infer_ras_win_len = gr.Slider(
+                        0,
+                        32,
+                        value=7,
+                        step=1,
+                        label="V2 RAS window",
+                        info="V2 only. 0 disables repetition-aware sampling.",
+                    )
+                    infer_ras_max_repeat = gr.Slider(
+                        1,
+                        8,
+                        value=2,
+                        step=1,
+                        label="V2 RAS max repeats",
+                        info="V2 only. 1 = strongest anti-loop.",
+                    )
+            with gr.Accordion("⚗️ Runtime", open=False):
+                v3_precision = gr.Dropdown(
+                    [
+                        ("Auto (bf16 · fast engine)", "auto"),
+                        ("bf16 · 12+ GB VRAM · fast engine", "bf16"),
+                        ("8-bit · 8+ GB VRAM · compatibility engine", "8bit"),
+                        ("4-bit · 6+ GB VRAM · compatibility engine", "4bit"),
+                    ],
+                    value="auto",
+                    label="Higgs V3 precision",
+                    info="bf16 runs on the fast CUDA-graph engine. 8/4-bit use the slower compatibility loop.",
+                )
+                v3_attention_backend = gr.Dropdown(
+                    [
+                        ("SDPA - stable PyTorch attention", "sdpa"),
+                        ("Eager - compatibility fallback", "eager"),
+                    ],
+                    value="sdpa",
+                    label="Attention backend (compatibility engine)",
+                )
+                v3_torch_compile = gr.Checkbox(
+                    label="torch.compile (compatibility engine only)",
+                    value=saved_v3_compile,
+                    info="Not needed on the fast engine. First run can take minutes to compile.",
+                )
+            with gr.Accordion("🏁 Presets", open=True):
+                with gr.Row(equal_height=True):
+                    adv_quality = gr.Radio(
+                        ["Draft", "Standard", "Optimal", "Custom"],
+                        value="Draft",
+                        label="Quality",
+                        info="Draft: one take, not checked. Standard: every take heard by ASR and checked against the text. "
+                        "Optimal: three takes, a strict text check and the voice compared with its reference; the best one stays.",
+                        scale=3,
+                    )
+                    adv_sampling_defaults_btn = gr.Button("Balanced sampling (t 0.80 · k 50 · p 0.95)", variant="secondary", scale=1)
+                    adv_easy_defaults_btn = gr.Button("Easy GUI sampling (t 1.00 · k 50 · p 0.95)", variant="secondary", scale=1)
+            with gr.Accordion("⚡ Live playback & speed", open=True):
+                with gr.Row(equal_height=True):
+                    adv_live = gr.Checkbox(
+                        label="Live playback while generating",
+                        value=True,
+                        info="Off: no streaming, the result plays when it is done (also the 📡 Live switch in the top bar). "
+                        "On: plays the speech as it is made, block after block on one clock, in the top bar's player only "
+                        "(the result player does not play it again). Esc stops it.",
+                    )
+                    adv_keep_models = gr.Checkbox(
+                        label="Keep check models loaded",
+                        value=True,
+                        info="ASR and the voice model stay in memory between renders (faster, ~2.5 GB more VRAM with turbo).",
+                    )
+                    adv_clear_cache_btn = gr.Button("🗑 Clear cached takes", variant="secondary", elem_classes=["red-btn"])
+            with gr.Accordion("🎧 Checks & retakes", open=False):
+                with gr.Row(equal_height=True):
+                    adv_asr_check = gr.Checkbox(label="Check every new take by ear (ASR)", value=False,
+                                                info="Recognition hears the take and compares it with the text (WER).")
+                    adv_similarity = gr.Checkbox(label="Check the voice matches its reference", value=False,
+                                                 info="WeSpeaker voice print of the take against the reference audio.")
+                    adv_similarity_min = gr.Slider(0.2, 0.9, value=0.5, step=0.01, label="Minimum voice similarity",
+                                                   info="Cosine of the voice prints. Same voice ≈ 0.6–0.95, another voice < 0.3.")
+                with gr.Row(equal_height=True):
+                    adv_strictness = gr.Radio(["Strict", "Normal", "Lenient"], value="Normal", label="Strictness",
+                                              info="Words allowed to differ: strict ≈ 10 %, normal ≈ 20 %, lenient ≈ 35 % (more in short blocks).")
+                    adv_takes = gr.Number(value=1, precision=0, minimum=1, maximum=20, label="Takes per block",
+                                          info="Takes made per block; the best one is kept.")
+                    adv_retries = gr.Number(value=2, precision=0, minimum=0, maximum=20, label="Retries on a failed check",
+                                            info="More takes when the best one fails a check.")
+                with gr.Row(equal_height=True):
+                    adv_asr_model = gr.Dropdown(ASR_CHOICES, value="CrisperWhisper 2.0 turbo", label="Check ASR model")
+                    adv_language = gr.Dropdown(list(WHISPER_LANGS), value="Auto-detect", label="Speech language",
+                                               info="For the ASR check and numbers in words.")
+                adv_sound_checks = gr.CheckboxGroup(
+                    choices=[(label, key) for key, label in tc.SOUND_CHECKS.items()],
+                    value=list(tc.CHEAP_CHECKS),
+                    label="Sound checks of every take",
+                    info="A defect redoes the take, a suspect is decided by ASR, a note is only shown. The last two are slower.",
+                )
+            with gr.Accordion("⏸ Pauses & finishing", open=False):
+                with gr.Row(equal_height=True):
+                    loud_on = gr.Checkbox(label="🔊 One loudness for every audio of the app", value=loudness.SETTINGS["on"], scale=3,
+                                          info="The files themselves: references used to generate (once, when first used), the voice library, "
+                                          "separated voices, every block and every output of every tab, "
+                                          "and the dataset clips: all at the same loudness. Applies everywhere, at once.")
+                    loud_target = gr.Slider(-30, -12, value=loudness.SETTINGS["target"], step=1, scale=2,
+                                            label="Loudness (LUFS)", info="−20 speech / audiobook · −16 podcast · −14 video. "
+                                            "Peaks stay under −1 dB.")
+                with gr.Row(equal_height=True):
+                    adv_pause_same = gr.Number(value=300, precision=0, minimum=0, maximum=10000, label="Pause, same speaker (ms)")
+                    adv_pause_other = gr.Number(value=600, precision=0, minimum=0, maximum=10000, label="Pause, other speaker (ms)")
+                    adv_final_loudness = gr.Dropdown(list(LOUDNESS_TARGETS), value="Off (as the model made it)",
+                                                     label="Final loudness of this delivery",
+                                                     info="A delivery target wins over the app's loudness for the final mix.")
+                with gr.Row(equal_height=True):
+                    adv_tidy = gr.Checkbox(label="Even pauses", value=False,
+                                           info="No silence at the edges of a take, so pauses between blocks are exactly as set; "
+                                           "a pause inside a take longer than 1.2 s is shortened.")
+                    adv_level = gr.Checkbox(label="Even loudness of the pieces", value=False,
+                                            info="Every take is brought to −20 LUFS before joining (already done when "
+                                            "“One loudness” is on).")
+                    adv_room_tone = gr.Checkbox(label="Room tone instead of digital silence", value=False,
+                                                info="Pauses get a quiet room tone so the joins sound natural.")
+                with gr.Row(equal_height=True):
+                    adv_enhance = gr.Checkbox(label="✨ Enhance voice: restore high frequencies, save at 48 kHz (LavaSR)", value=False,
+                                              info="A 56 MB model rebuilds the band above 12 kHz the speech model does not make; "
+                                              "the voice below stays untouched. Fast (well over realtime on GPU). Downloads on first use.")
+                    adv_enhance_denoise = gr.Checkbox(label="Denoise before enhancing", value=False,
+                                                      info="Only for noisy results: the denoiser works at 16 kHz and the enhancer rebuilds the rest.")
+            with gr.Accordion("🔢 Text before voicing", open=False):
+                adv_words = gr.CheckboxGroup(
+                    choices=[("Numbers", "numbers"), ("Years", "years"), ("Times (10:30)", "times"), ("Money ($ €)", "money"),
+                             ("Ordinals (1º, 2nd)", "ordinals"), ("Percent", "percent")],
+                    value=[],
+                    label="Read with words",
+                    info="Written out in the speech language before voicing (num2words). Tags stay untouched.",
+                )
+            with gr.Accordion("🧠 LLM · director & podcast writer", open=False):
+                _llm_saved = llm_load_settings()
+                with gr.Row(equal_height=True):
+                    llm_provider = gr.Radio(["Local (llama.cpp)", "OpenAI-compatible server"],
+                                            value=_llm_saved.get("provider", "Local (llama.cpp)"), label="Where the LLM runs",
+                                            info="Local: llama.cpp on this GPU with a GGUF. Server: LM Studio, Ollama, vLLM… (OpenAI API).")
+                    llm_free_tts = gr.Checkbox(value=bool(_llm_saved.get("free_tts", True)),
+                                               label="Share the GPU: unload speech before the LLM loads, stop the LLM before voicing")
+                with gr.Row(equal_height=True):
+                    llm_local_model = gr.Dropdown(llm.local_choices(), value=_llm_saved.get("local_model") or llm.default_local_choice(),
+                                                  label="Local model (GGUF)", allow_custom_value=True, scale=4,
+                                                  info="Recommended Gemma 4 12B quants (✓ on disk, ⬇ downloads on first use); any .gguf in models/llm shows up too.")
+                    llm_download_btn = gr.Button("⬇ Download / check", variant="secondary", scale=1)
+                    llm_unload_btn = gr.Button("⏏ Unload LLM", variant="secondary", scale=1)
+                with gr.Row(equal_height=True):
+                    llm_url = gr.Textbox(value=_llm_saved.get("url", "http://127.0.0.1:1234/v1"), label="Server address", scale=3)
+                    llm_api_key = gr.Textbox(value="", type="password", label="API key (optional, never saved)", scale=2)
+                    llm_remote_model = gr.Dropdown(choices=[_llm_saved["remote_model"]] if _llm_saved.get("remote_model") else [],
+                                                   value=_llm_saved.get("remote_model") or None, allow_custom_value=True,
+                                                   label="Server model", scale=3)
+                    llm_check_btn = gr.Button("🔌 Check remote connection", variant="secondary", scale=1)
+                with gr.Row(equal_height=True):
+                    llm_ctx = gr.Number(value=int(_llm_saved.get("ctx", 16384)), precision=0, minimum=2048, maximum=131072,
+                                        label="Context (tokens)")
+                    llm_temperature = gr.Slider(0.0, 1.5, value=float(_llm_saved.get("temperature", 0.7)), step=0.05,
+                                                label="LLM temperature")
+                llm_status = gr.Markdown("")
         with gr.Accordion("🖥️ Console", open=True, elem_classes=["console-accordion"]):
             cmd_console = gr.HTML(value=cmd_mirror_html())
         cmd_console_timer = gr.Timer(1.0, active=True) if hasattr(gr, "Timer") else None
@@ -4412,7 +6229,26 @@ def build_ui():
             infer_seed,
             infer_reuse_chunk_seed,
         ]
-        voice_dropdowns = [sample_dropdown, infer_sample_select, *speaker_inputs[1::4]]
+        adv_inputs = [
+            adv_asr_check, adv_asr_model, adv_language, adv_similarity, adv_similarity_min, adv_strictness, adv_takes,
+            adv_retries, adv_sound_checks, adv_pause_same, adv_pause_other, adv_tidy, adv_level, adv_room_tone,
+            adv_final_loudness, adv_words, adv_live, adv_keep_models, adv_enhance, adv_enhance_denoise,
+        ]
+        assert len(adv_inputs) == len(ADV_KEYS)
+
+        def apply_quality(mode):
+            q = tc.QUALITY_PRESETS.get(mode)
+            if not q:
+                return gr.update(), gr.update(), gr.update(), gr.update()
+            return q["asr_check"], q["takes"], q["similarity"], q["strictness"]
+
+        adv_quality.input(apply_quality, adv_quality, [adv_asr_check, adv_takes, adv_similarity, adv_strictness], queue=False)
+        for comp in (adv_asr_check, adv_takes, adv_similarity, adv_strictness):
+            comp.input(lambda: "Custom", None, adv_quality, queue=False)
+        adv_sampling_defaults_btn.click(lambda: (0.8, 50, 0.95), None, [infer_temperature, infer_top_k, infer_top_p], queue=False)
+        adv_easy_defaults_btn.click(lambda: (1.0, 50, 0.95), None, [infer_temperature, infer_top_k, infer_top_p], queue=False)
+        adv_clear_cache_btn.click(lambda: log(clear_take_cache()), None, logs_box, queue=False)
+        voice_dropdowns = [sample_dropdown, infer_sample_select]
         sample_dropdown.change(
             lambda name: (*load_sample_for_ui(name), name),
             sample_dropdown,
@@ -4451,7 +6287,7 @@ def build_ui():
             save_sample_ui,
             [prep_audio_player, save_sample_name, prep_transcription],
             [*voice_dropdowns, prep_sample_console, save_sample_btn],
-        )
+        ).then(dialogue_sync, [dialogue_editor, infer_model_select], dialogue_editor, queue=False)
 
         infer_sample_select.change(
             load_sample_for_ui,
@@ -4460,6 +6296,16 @@ def build_ui():
             queue=False,
         )
         refresh_infer_sample_btn.click(refresh_sample_dropdown, None, infer_sample_select, queue=False)
+        for _src, _eng, _btn, _undo, _orig, _note in (
+            (infer_ref_audio, infer_clean_engine, infer_clean_btn, infer_clean_undo, infer_clean_orig, infer_clean_note),
+            (prep_audio_player, prep_clean_engine, prep_clean_btn, prep_clean_undo, prep_clean_orig, prep_clean_note),
+            *pc_sep_parts,
+        ):
+            _btn.click(clean_reference_audio, [_src, _eng, _orig], [_src, _orig, _note], concurrency_limit=1,
+                       concurrency_id="ref_clean")
+            _undo.click(restore_reference_audio, _orig, [_src, _orig, _note], queue=False)
+        infer_sample_select.change(lambda: None, None, infer_clean_orig, queue=False)
+        sample_dropdown.change(lambda: None, None, prep_clean_orig, queue=False)
         wire_clip_import(infer_import_parts, infer_ref_audio, infer_ref_text)
         wire_clip_import(prep_import_parts, prep_audio_player, prep_transcription, save_sample_name)
         infer_ref_transcribe_start = infer_transcribe_ref_btn.click(
@@ -4506,7 +6352,7 @@ def build_ui():
             show_progress="hidden",
         )
         ev_inf = infer_start.then(
-            run_inference,
+            run_inference_ui,
             [
                 infer_text,
                 infer_model_select,
@@ -4518,8 +6364,9 @@ def build_ui():
                 infer_save_outputs,
                 infer_chunk_mode,
                 infer_carry_tags,
+                *adv_inputs,
             ],
-            [infer_audio_out, infer_file_out, infer_text, infer_console, infer_gen_btn, infer_stop_btn, infer_progress],
+            [infer_audio_out, infer_file_out, infer_text, infer_console, infer_gen_btn, infer_stop_btn, infer_progress, infer_blocks],
             show_progress="hidden",
         )
         infer_stop_btn.click(
@@ -4543,16 +6390,16 @@ def build_ui():
             [
                 infer_model_select,
                 lora_adapter,
-                dialogue_silence_slider,
                 *common_params,
                 infer_save_outputs,
                 infer_chunk_mode,
                 infer_carry_tags,
-                dialogue_row_count,
-                *speaker_inputs,
+                dialogue_editor,
+                dlg_only_changed,
+                *adv_inputs,
             ],
-            [dialogue_audio_out, dialogue_file_out, infer_console, dialogue_gen_btn, dialogue_stop_btn],
-            show_progress_on=[dialogue_audio_out],
+            [dialogue_audio_out, dialogue_file_out, infer_console, dialogue_gen_btn, dialogue_stop_btn, dialogue_progress, dialogue_blocks],
+            show_progress="hidden",
         )
         dialogue_stop_btn.click(
             stop_dialogue_generation,
@@ -4562,62 +6409,102 @@ def build_ui():
             show_progress="hidden",
             cancels=[ev_dialogue],
         )
-        dialogue_text_inputs = speaker_inputs[0::4]
-        dialogue_speaker_inputs = speaker_inputs[1::4]
-        dialogue_audio_inputs = speaker_inputs[2::4]
-        dialogue_ref_text_inputs = speaker_inputs[3::4]
-        dialogue_edit_outputs = [
-            dialogue_row_count,
-            *dialogue_text_inputs,
-            *dialogue_speaker_inputs,
-            *dialogue_audio_inputs,
-            *dialogue_ref_text_inputs,
-            *dialogue_rows,
-            infer_console,
-        ]
-        dialogue_reset_btn.click(
-            reset_dialogue_rows,
-            gr.State(default_sample_name),
-            dialogue_edit_outputs,
-            queue=False,
+        dialogue_refresh_lora_btn.click(dialogue_sync, [dialogue_editor, infer_model_select], dialogue_editor, queue=False)
+        infer_model_select.change(dialogue_sync, [dialogue_editor, infer_model_select], dialogue_editor, queue=False)
+
+        # ================================================================ LLM, director, podcast, fixer, montage
+        llm_inputs = [llm_provider, llm_local_model, llm_url, llm_api_key, llm_remote_model, llm_ctx, llm_temperature, llm_free_tts]
+        for comp in llm_inputs:
+            if comp is not llm_api_key:
+                comp.change(llm_save_settings, llm_inputs, None, queue=False, show_progress="hidden")
+        llm_check_btn.click(llm_check, [llm_provider, llm_url, llm_api_key, llm_local_model], [llm_status, llm_remote_model], queue=False)
+        llm_download_btn.click(llm_download, llm_local_model, [llm_status, llm_local_model])
+        llm_unload_btn.click(llm_unload, None, llm_status, queue=False)
+
+        infer_dir_btn.click(
+            director_inference, [infer_dir_op, infer_text, infer_dir_instr, adv_language, *llm_inputs],
+            [infer_text, infer_dir_note, infer_split_lines, studio_tabs],
+        ).then(dialogue_from_lines, [infer_split_lines, dialogue_editor, infer_model_select], [dialogue_editor, dlg_dir_note], queue=False)
+        dlg_dir_btn.click(
+            director_dialogue, [dlg_dir_op, dlg_dir_instr, adv_language, dialogue_editor, infer_model_select, *llm_inputs],
+            [dialogue_editor, dlg_dir_note],
+        )
+
+        pc_count.change(lambda n: [gr.update(visible=i < int(n)) for i in range(PODCAST_MAX_SPEAKERS)], pc_count, pc_speaker_rows,
+                        queue=False, show_progress="hidden")
+        pc_sync_inputs = [pc_editor, infer_model_select, pc_count, *pc_speaker_inputs]
+        pc_count.change(podcast_sync, pc_sync_inputs, pc_editor, queue=False, show_progress="hidden")
+        for k, comp in enumerate(pc_speaker_inputs):
+            (comp.blur if k % PODCAST_SPK_FIELDS in (0, 1, 5) else comp.change)(podcast_sync, pc_sync_inputs, pc_editor, queue=False,
+                                                                                 show_progress="hidden")
+        pc_write_btn.click(podcast_write, [pc_editor, pc_topic, pc_language, pc_minutes, infer_model_select, pc_count,
+                                           *pc_speaker_inputs, *llm_inputs], [pc_editor, pc_note])
+        pc_continue_btn.click(podcast_continue, [pc_editor, pc_direction, pc_language, pc_minutes, infer_model_select, pc_count,
+                                                 *pc_speaker_inputs, *llm_inputs], [pc_editor, pc_note])
+        pc_clear_btn.click(podcast_clear, pc_sync_inputs, [pc_editor, pc_note], queue=False)
+        pc_dir_btn.click(podcast_director, [pc_dir_op, pc_dir_instr, pc_language, pc_editor, infer_model_select, pc_count,
+                                            *pc_speaker_inputs, *llm_inputs], [pc_editor, pc_dir_note])
+        pc_to_dialogue_btn.click(podcast_to_dialogue, [pc_editor, dialogue_editor, infer_model_select, pc_count, *pc_speaker_inputs],
+                                 [dialogue_editor, pc_note, main_tabs, studio_tabs], queue=False)
+        ev_pc = pc_gen_btn.click(
+            lambda: (set_button_busy("Voicing…"), gr.update(interactive=True)), None, [pc_gen_btn, pc_stop_btn],
+            queue=False, show_progress="hidden",
+        ).then(
+            run_podcast,
+            [pc_editor, infer_model_select, lora_adapter, *common_params, infer_save_outputs, infer_chunk_mode, infer_carry_tags,
+             pc_pause_same, pc_pause_other, pc_only_changed, pc_count, *pc_speaker_inputs, *adv_inputs],
+            [pc_audio_out, pc_file_out, pc_report, pc_progress, pc_blocks, pc_gen_btn, pc_stop_btn],
             show_progress="hidden",
         )
-        dialogue_clear_btn.click(
-            clear_dialogue_rows,
-            [dialogue_row_count, *speaker_inputs],
-            dialogue_edit_outputs,
-            queue=False,
+        pc_stop_btn.click(lambda: stop_render("🎙 Voice the podcast"), None, [pc_gen_btn, pc_stop_btn], queue=False, cancels=[ev_pc])
+
+        fx_transcribe_btn.click(fixer_transcribe, [fx_audio, fx_sava, *adv_inputs],
+                                [fx_words_state, fx_original, fx_edited, fx_note])
+        ev_fx = fx_run_btn.click(
+            lambda: (set_button_busy("Fixing…"), gr.update(interactive=True)), None, [fx_run_btn, fx_stop_btn],
+            queue=False, show_progress="hidden",
+        ).then(
+            fixer_run,
+            [fx_audio, fx_words_state, fx_edited, fx_match, fx_lora,
+             infer_model_select, *common_params,
+             *adv_inputs],
+            [fx_audio_out, fx_report, fx_progress, fx_blocks, fx_run_btn, fx_stop_btn],
             show_progress="hidden",
         )
-        dialogue_compact_btn.click(
-            remove_empty_dialogue_rows,
-            [dialogue_row_count, *speaker_inputs],
-            dialogue_edit_outputs,
-            queue=False,
-            show_progress="hidden",
+        fx_edited.change(fixer_plan, [fx_words_state, fx_edited], fx_plan, queue=False, show_progress="hidden")
+        fx_stop_btn.click(lambda: stop_render("🩹 Fix the changed words"), None, [fx_run_btn, fx_stop_btn], queue=False, cancels=[ev_fx])
+
+        for parts, state in ((infer_send, infer_blocks), (dialogue_send, dialogue_blocks), (pc_send, pc_blocks), (fx_send, fx_blocks)):
+            send, ask, append, replace, cancel, note = parts
+            send.click(lambda: gr.update(visible=True), None, ask, queue=False, show_progress="hidden")
+            cancel.click(lambda: gr.update(visible=False), None, ask, queue=False, show_progress="hidden")
+            append.click(montage_send, [gr.State("append"), state, montage_tl], [montage_tl, ask, note, main_tabs], queue=False)
+            replace.click(montage_send, [gr.State("replace"), state, montage_tl], [montage_tl, ask, note, main_tabs], queue=False)
+        def _set_loudness(on, target):
+            loudness.configure(on, target)
+            _save_ui_settings(loudness_on=bool(on), loudness_target=float(target))
+            print(f"[loudness] {'on' if on else 'off'} · {float(target):g} LUFS", flush=True)
+
+        loud_on.change(_set_loudness, [loud_on, loud_target], None, queue=False, show_progress="hidden")
+        loud_target.change(_set_loudness, [loud_on, loud_target], None, queue=False, show_progress="hidden")
+        montage_tl.submit(
+            montage_request,
+            [montage_tl, infer_model_select, lora_adapter, *common_params, infer_chunk_mode, infer_carry_tags, *adv_inputs, *llm_inputs],
+            [montage_tl, montage_progress], show_progress="hidden",
         )
-        for i in range(DIALOGUE_MAX_SEGMENTS):
-            dialogue_add_btns[i].click(
-                add_dialogue_row,
-                [gr.State(i), dialogue_row_count, *speaker_inputs],
-                dialogue_edit_outputs,
-                queue=False,
-                show_progress="hidden",
-            )
-            dialogue_copy_btns[i].click(
-                copy_dialogue_row,
-                [gr.State(i), dialogue_row_count, *speaker_inputs],
-                dialogue_edit_outputs,
-                queue=False,
-                show_progress="hidden",
-            )
-            dialogue_delete_btns[i].click(
-                delete_dialogue_row,
-                [gr.State(i), dialogue_row_count, *speaker_inputs],
-                dialogue_edit_outputs,
-                queue=False,
-                show_progress="hidden",
-            )
+        montage_save_btn.click(montage_save, [montage_tl, montage_name], [montage_saved, montage_note], queue=False)
+        montage_load_btn.click(montage_load, montage_saved, [montage_tl, montage_note], queue=False)
+        montage_new_btn.click(montage_new, montage_tl, [montage_tl, montage_note], queue=False)
+        montage_export_btn.click(montage_export, [montage_tl, montage_name, montage_fmt], [montage_audio, montage_file, montage_note])
+
+        extras_refresh_btn.click(lambda: (extras_status(), gr.update(choices=extras_choices(), value=[])), None,
+                                 [extras_md, extras_pick], queue=False)
+        extras_lava_btn.click(lambda: extras_download("lavasr"), None, extras_md)
+        extras_del_btn.click(extras_ask, extras_pick, [extras_confirm_row, extras_modal.md], queue=False)
+        extras_cancel_btn.click(lambda: gr.update(visible=False), None, extras_confirm_row, queue=False)
+        extras_confirm_btn.click(extras_delete, extras_pick, [extras_md, extras_pick, extras_confirm_row], queue=False)
+        extras_wespeaker_btn.click(lambda: extras_download("wespeaker"), None, extras_md)
+        extras_llama_btn.click(lambda: extras_download("llama"), None, extras_md)
 
         dataset_source_mode.change(
             on_dataset_mode_change,
@@ -4920,6 +6807,7 @@ def build_ui():
                 v3_min_delta,
                 v3_restore_best,
                 v3_max_batch_sec,
+                v3_best_only,
             ],
             [logs_box, training_status_box, training_log_box, start_btn, stop_train_btn, refresh_training_btn, tb_btn],
         )
@@ -4945,7 +6833,8 @@ def build_ui():
             )
         if cmd_console_timer is not None:
             cmd_console_timer.tick(cmd_mirror_html, None, cmd_console, queue=False, show_progress="hidden")
-        demo.load(fn=None, js=APP_JS.replace("__TAG_CATALOG__", json.dumps(tag_autocomplete_catalog())), queue=False)
+        demo.load(fn=None, js=APP_JS.replace("__TAG_CATALOG__", json.dumps(tag_autocomplete_catalog())).replace(
+            "__SEP_ENGINES__", json.dumps(REF_CLEAN_ENGINES)), queue=False)
         tb_btn.click(launch_tensorboard, output_name, [logs_box, training_status_box, training_log_box], queue=False)
 
         v3_precision.change(set_v3_runtime, [v3_precision, v3_attention_backend, v3_torch_compile], logs_box, queue=False)
@@ -4978,22 +6867,29 @@ def build_ui():
             queue=True,
             cancels=[ev_inf, ev_dialogue],
         )
-        delete_outputs_btn.click(
-            delete_output_audios,
-            None,
-            logs_box,
-            queue=True,
-        )
-        delete_samples_btn.click(
-            delete_reference_samples,
-            None,
-            logs_box,
-            queue=True,
-        )
+        # the top bar's Live switch and the one in Advanced are the same setting
+        top_live.input(lambda v: bool(v), top_live, adv_live, queue=False)
+        adv_live.change(lambda v: bool(v), adv_live, top_live, queue=False)
+        delete_outputs_btn.click(lambda: danger_ask("outputs"), None, [danger_kind, danger.box, danger.md], queue=False)
+        delete_samples_btn.click(lambda: danger_ask("samples"), None, [danger_kind, danger.box, danger.md], queue=False)
+        gui_preset_delete_btn.click(lambda name: danger_ask("preset", name), gui_preset_select,
+                                    [danger_kind, danger.box, danger.md], queue=False)
+        danger_cancel.click(lambda: ("", gr.update(visible=False)), None, [danger_kind, danger.box], queue=False)
+        danger_ok.click(danger_run, [danger_kind, gui_preset_select], [danger_kind, danger.box, logs_box, gui_preset_select])
+
+        # ---------------- GUI presets: every setting and selection of the page
+        preset_comps = collect_preset_components(dict(locals()))
+        preset_names = list(preset_comps)
+        preset_list = list(preset_comps.values())
+        print(f"[preset] {len(preset_names)} settings are saved in a GUI preset", flush=True)
+        gui_preset_save_btn.click(lambda name, *v: save_gui_preset(preset_names, name, *v), [gui_preset_select, *preset_list],
+                                  gui_preset_select, queue=False)
+        gui_preset_load_btn.click(lambda name: load_gui_preset(preset_names, preset_list, name), gui_preset_select, preset_list,
+                                  queue=False)
 
     return demo
 
 
 if __name__ == "__main__":
     _install_cmd_mirror()
-    build_ui().queue(default_concurrency_limit=1).launch(inbrowser=True, css=UI_CSS, js=APP_JS, theme=build_theme(), allowed_paths=[str(ROOT / "exp")])
+    build_ui().queue(default_concurrency_limit=1).launch(inbrowser=True, css=UI_CSS, js=APP_JS, theme=build_theme(), allowed_paths=[str(ROOT / "exp"), str(CACHE_DIR), str(OUTPUTS_DIR), str(ROOT / "projects"), str(TEMP_DIR)])

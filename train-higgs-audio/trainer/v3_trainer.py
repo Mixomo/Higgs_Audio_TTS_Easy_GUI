@@ -882,6 +882,8 @@ def train(args: argparse.Namespace) -> None:
                     stop_reason = verdict["stop"]
             if eval_due:
                 make_eval_audio(optimizer_step)
+            if save_due and args.best_only:
+                save_due = False  # best only: no numbered snapshots, the run is not resumable
             if save_due:
                 checkpoint_dir = output_dir / f"checkpoint-{optimizer_step}"
                 save_checkpoint(model, tokenizer, checkpoint_dir, args.use_lora)
@@ -899,16 +901,19 @@ def train(args: argparse.Namespace) -> None:
     finished_normally = stop_reason is None
     if stop_reason:
         print(f"[v3-train] Early stop at optimizer_step={optimizer_step}: {stop_reason}", flush=True)
-    # The last weights stay resumable as a regular checkpoint.
+    # The last weights stay resumable as a regular checkpoint (not in best-only mode).
     last_dir = output_dir / f"checkpoint-{optimizer_step}"
-    if optimizer_step > 0 and not (last_dir / "trainer_state.pt").exists():
+    if args.best_only:
+        pass
+    elif optimizer_step > 0 and not (last_dir / "trainer_state.pt").exists():
         save_checkpoint(model, tokenizer, last_dir, args.use_lora)
         save_training_state(last_dir, optimizer, scheduler, optimizer_step, micro_step, args, extra_state(stop_reason))
     elif optimizer_step > 0:
         # Already saved at this step before the stop decision: refresh it with the final guard state.
         save_training_state(last_dir, optimizer, scheduler, optimizer_step, micro_step, args, extra_state(stop_reason))
     save_checkpoint(model, tokenizer, output_dir, args.use_lora)
-    save_training_state(output_dir, optimizer, scheduler, optimizer_step, micro_step, args, extra_state(stop_reason))
+    if not args.best_only:
+        save_training_state(output_dir, optimizer, scheduler, optimizer_step, micro_step, args, extra_state(stop_reason))
     final_source = "last"
     if args.restore_best and args.use_lora and (best_dir / "qwen3_lora").exists() and guard.best_step not in (None, optimizer_step):
         # Final adapter = best eval (anti-overfitting). Root is no longer a resume point:
@@ -918,6 +923,22 @@ def train(args: argparse.Namespace) -> None:
         (output_dir / "trainer_state.pt").unlink(missing_ok=True)
         final_source = f"best (step {guard.best_step})"
         print(f"[v3-train] Final adapter restored from checkpoint-best (step {guard.best_step}, eval {guard.best:.5f}).", flush=True)
+    if args.best_only:
+        # Only the final adapter stays: the best eval when there is one, else the last weights. checkpoint-best is
+        # folded into it (its best_info.json is kept at the run root), no optimizer state anywhere.
+        if args.use_lora and (best_dir / "qwen3_lora").exists() and final_source == "last" and guard.best_step not in (None, optimizer_step):
+            shutil.rmtree(output_dir / "qwen3_lora", ignore_errors=True)
+            shutil.copytree(best_dir / "qwen3_lora", output_dir / "qwen3_lora")
+            final_source = f"best (step {guard.best_step})"
+        if (best_dir / "best_info.json").exists():
+            shutil.copyfile(best_dir / "best_info.json", output_dir / "best_info.json")
+        shutil.rmtree(best_dir, ignore_errors=True)
+        (output_dir / "trainer_state.pt").unlink(missing_ok=True)
+        for old_ckpt in output_dir.glob("checkpoint-*"):
+            if old_ckpt.is_dir() and old_ckpt.name.split("-", 1)[1].isdigit():
+                shutil.rmtree(old_ckpt, ignore_errors=True)
+        size = sum(f.stat().st_size for f in (output_dir / "qwen3_lora").rglob("*") if f.is_file()) if (output_dir / "qwen3_lora").exists() else 0
+        print(f"[v3-train] Best only: final adapter = {final_source}, {size / 1e6:.1f} MB; no resumable checkpoints kept.", flush=True)
     if finished_normally and guard.last_eval_step != optimizer_step:
         make_eval_audio(optimizer_step, "_final")
     metrics.write(
@@ -1237,6 +1258,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--early_stop_min_delta", type=float, default=0.002, help="Relative improvement that resets patience")
     parser.add_argument("--early_stop_min_evals", type=int, default=3)
     parser.add_argument("--restore_best", action="store_true", help="Final adapter = best eval checkpoint")
+    parser.add_argument("--best_only", action="store_true", help="Keep only the final (best) adapter: no numbered checkpoints, not resumable")
     parser.add_argument("--eval_seed", type=int, default=1234)
     parser.add_argument("--prodigy_d_coef", type=float, default=1.0, help="Scales Prodigy's LR estimate (0.5 = half, 2 = double)")
     parser.add_argument("--prodigy_d0", type=float, default=1e-5, help="Prodigy's starting LR estimate (raise if it stalls)")

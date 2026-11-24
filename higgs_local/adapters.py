@@ -203,6 +203,15 @@ def lora_checkpoints(kind: str, project: str | None) -> list[tuple[str, str]]:
         final_fp = _fingerprint(final)
         same_step = next((step for step, path in steps if final_fp and _fingerprint(path) == final_fp), None)
         label = f"Final · step {same_step}" if same_step is not None else "Final"
+        if (base / "best_info.json").exists() and not (base / "checkpoint-best").exists():
+            # a best-only run: the final adapter is its best eval
+            try:
+                import json
+
+                info = json.loads((base / "best_info.json").read_text(encoding="utf-8"))
+                label = f"Final (best) · step {info['step']} · loss {float(info['eval_loss']):.3f}"
+            except Exception:
+                label = "Final (best)"
         choices.append((f"{label} · {when(final)}", final.relative_to(ROOT).as_posix()))
         if same_step is not None:
             steps = [(s, p) for s, p in steps if s != same_step]

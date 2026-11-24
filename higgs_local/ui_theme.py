@@ -72,6 +72,27 @@ def build_theme() -> gr.themes.Base:
         border_color_accent="*primary_300",
         border_color_accent_dark="*primary_600",
         layout_gap="10px",
+        # Gradio paints groups, form gaps and many borders with these: keep them in the app's palette
+        border_color_primary="#e7e7ee",
+        border_color_primary_dark="#24242f",
+        panel_background_fill="#ffffff",
+        panel_background_fill_dark="#14141b",
+        panel_border_color="#e7e7ee",
+        panel_border_color_dark="#24242f",
+        code_background_fill="#f1f1f5",
+        code_background_fill_dark="#101016",
+        table_border_color="#e7e7ee",
+        table_border_color_dark="#24242f",
+        table_even_background_fill="#ffffff",
+        table_even_background_fill_dark="#14141b",
+        table_odd_background_fill="#fafafc",
+        table_odd_background_fill_dark="#111118",
+        table_row_focus="*primary_50",
+        table_row_focus_dark="rgba(139, 92, 246, 0.14)",
+        input_background_fill_hover_dark="#12121a",
+        block_label_border_color_dark="#24242f",
+        block_title_background_fill_dark="transparent",
+        accordion_text_color_dark="*neutral_200",
     )
 
 
@@ -109,6 +130,9 @@ CSS = """
 .dark .chip.ok { color: #4ade80; }
 .dark .chip.accent { color: #c4b5fd; }
 .header-actions { justify-content: flex-end; gap: 8px !important; }
+.header-actions { align-items: center; }
+.header-actions .gui-preset-select { margin-left: auto; }
+.gui-preset-select input::placeholder { opacity: .7; }
 .header-actions button { flex: 0 0 auto !important; min-width: 0 !important; }
 
 /* ---------- cards & sections ---------- */
@@ -378,3 +402,58 @@ TRAINING_WARNING_HTML = """
   </div>
 </div>
 """
+
+
+CSS += r'''
+
+/* ---------------- modals: a card over the page, the page blurred behind it */
+.hv-modal { position: fixed !important; inset: 0 !important; z-index: 9500 !important; display: flex; align-items: center;
+  justify-content: center; padding: 24px !important; margin: 0 !important; width: auto !important; max-width: none !important;
+  min-width: 0 !important; background: rgba(6, 6, 14, .55) !important; backdrop-filter: blur(8px) saturate(115%);
+  -webkit-backdrop-filter: blur(8px) saturate(115%); border: 0 !important; border-radius: 0 !important; gap: 0 !important;
+  animation: hv-fade .16s ease-out; }
+.hv-modal > .hv-card, .hv-card.tl-modal { width: min(620px, calc(100vw - 32px)) !important; max-width: 620px; flex: 0 0 auto !important;
+  max-height: calc(100vh - 48px); overflow: auto; background: var(--block-background-fill) !important; color: var(--body-text-color);
+  border: 1px solid var(--border-color-primary) !important; border-radius: 18px !important; padding: 18px 20px 16px !important;
+  box-shadow: 0 24px 64px rgba(0, 0, 0, .45), 0 2px 10px rgba(0, 0, 0, .25); gap: 12px !important;
+  animation: hv-pop .2s cubic-bezier(.2, .9, .3, 1.15); }
+.hv-card.tl-modal { width: min(720px, calc(100vw - 32px)) !important; max-width: 720px; }
+.hv-modal.hide, .hv-modal.hidden, .hv-modal[hidden] { display: none !important; }
+.hv-head { display: flex; align-items: center; gap: 10px; }
+.hv-title { flex: 1; font-size: 16px; font-weight: 650; letter-spacing: -.01em; color: var(--body-text-color); }
+.hv-x { width: 32px; height: 32px; border: 0; border-radius: 10px; background: transparent; color: var(--body-text-color-subdued);
+  font-size: 15px; cursor: pointer; transition: background .12s, color .12s; }
+.hv-x:hover { background: var(--background-fill-secondary); color: var(--body-text-color); }
+.hv-text, .hv-text p, .hv-text li { color: var(--body-text-color-subdued) !important; font-size: 14px; }
+.hv-text code { font-size: 12px; }
+.hv-actions { justify-content: flex-end !important; gap: 8px !important; flex-wrap: wrap !important; margin-top: 4px; }
+.hv-actions > button, .hv-actions button { flex: 0 0 auto !important; min-width: 104px !important; width: auto !important; padding-inline: 14px !important; }
+.hv-card .hv-hidden-label { display: none; }
+@keyframes hv-fade { from { opacity: 0; } to { opacity: 1; } }
+@keyframes hv-pop { from { opacity: 0; transform: translateY(10px) scale(.97); } to { opacity: 1; transform: none; } }
+@media (prefers-reduced-motion: reduce) { .hv-modal, .hv-modal > .hv-card, .hv-card.tl-modal { animation: none; } }
+'''
+
+
+CSS += r'''
+
+/* ---------------- one palette end to end: no gray slabs from Gradio's defaults */
+.gr-group, .gr-group > .styler, .gr-group .styler, .form, .form > .styler {
+  background: var(--block-background-fill) !important; }
+.gr-group { border: 1px solid var(--block-border-color) !important; border-radius: var(--block-radius) !important;
+  overflow: hidden; }
+.gr-group .form, .gr-group > .styler > .block, .gr-group .block { border-color: var(--block-border-color) !important; }
+.form { border-color: var(--block-border-color) !important; }
+.dark code, .dark pre { background: var(--code-background-fill) !important; border: 1px solid var(--border-color-primary); }
+.dark th, .dark th.header-cell { background: #17171f !important; color: var(--body-text-color) !important; }
+.dark td, .dark th, .dark table, .dark tr { border-color: var(--table-border-color) !important; }
+.prose table { border-radius: 10px; overflow: hidden; border-collapse: separate; border-spacing: 0; border: 1px solid var(--table-border-color); }
+.dark .warn-box { border-color: rgba(239, 68, 68, .28) !important; }
+.dark .upload-container, .dark .wrap.default, .dark [data-testid="upload"], .dark .audio-container .empty {
+  background: var(--input-background-fill) !important; }
+.dark ::-webkit-scrollbar { width: 10px; height: 10px; }
+.dark ::-webkit-scrollbar-track { background: transparent; }
+.dark ::-webkit-scrollbar-thumb { background: #262633; border-radius: 10px; border: 2px solid var(--body-background-fill); }
+.dark ::-webkit-scrollbar-thumb:hover { background: #33334a; }
+input[type=range] { accent-color: var(--color-accent); }
+'''

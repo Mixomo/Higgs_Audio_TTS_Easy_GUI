@@ -894,6 +894,7 @@ def build_v3_training_command(
     restore_best: bool = True,
     max_batch_seconds: float = 40.0,
     eval_seed: int = 1234,
+    best_only: bool = False,
 ) -> tuple[list[str], str]:
     if task_type not in {"single_speaker_smart_voice", "zero_shot_voice_cloning"}:
         raise ValueError("Custom V3 trainer currently supports single_speaker_smart_voice and zero_shot_voice_cloning only.")
@@ -958,6 +959,8 @@ def build_v3_training_command(
     ]
     if restore_best:
         args.append("--restore_best")
+    if best_only:
+        args.append("--best_only")
     if gradient_checkpointing:
         args.append("--gradient_checkpointing")
     if eval_dir:
