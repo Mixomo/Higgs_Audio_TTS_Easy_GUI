@@ -14,6 +14,7 @@ exp/
 models/
 projects/
 config/*.json
+config/session/
 torch_backend.txt
 config/gui_presets/prueba.json
 

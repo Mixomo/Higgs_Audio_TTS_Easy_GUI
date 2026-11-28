@@ -154,3 +154,97 @@ def describe_folder(folder: Path) -> str:
             pass
     names = "\n".join(f"- {w.name}" for w in wavs[:12]) + ("\n- ..." if len(wavs) > 12 else "")
     return f"**{len(wavs)} audio file(s)**, {total / 60:.1f} min in `{folder}`\n\n{names}"
+
+
+# ---------------------------------------------------------------- one reference clip (Inference, Voice Library)
+REFERENCES_DIR = DOWNLOADS_DIR / "references"
+_URL_T = re.compile(r"[?&#](?:t|start)=(?:(\d+)h)?(?:(\d+)m)?(\d+)s?(?:&|$)")
+
+
+def url_start(url: str) -> float | None:
+    """The start time a shared link carries (``?t=90``, ``&t=1m30s``), or None."""
+    m = _URL_T.search(url or "")
+    if not m:
+        return None
+    h, mi, s = (int(x) if x else 0 for x in m.groups())
+    return float(h * 3600 + mi * 60 + s)
+
+
+def clip_times(url: str, start: str = "", end: str = "") -> tuple[float, float | None]:
+    """(start, end) in seconds. Empty start: the link's ``t=`` or 0; empty end: None, up to the end of the video
+    (nothing is cut to a fixed length: the whole part asked for is downloaded)."""
+    s = _seconds(start) if (start or "").strip() else (url_start(url) or 0.0)
+    e = _seconds(end) if (end or "").strip() else None
+    if e is not None and e <= s:
+        raise ValueError("“To” must be after “From”.")
+    return s, e
+
+
+def download_clip(
+    url: str,
+    start: str = "",
+    end: str = "",
+    folder: Path = REFERENCES_DIR,
+    progress: Callable[[float, str], None] | None = None,
+) -> tuple[Path, str]:
+    """Download one video's audio (all of it, or the From / To part) as a mono WAV. Returns (file, video title)."""
+    import imageio_ffmpeg
+    import yt_dlp
+    from yt_dlp.utils import download_range_func
+
+    url = (url or "").strip()
+    if not re.match(r"^https?://", url):
+        raise ValueError("Paste a video link (https://…).")
+    s, e = clip_times(url, start, end)
+    folder.mkdir(parents=True, exist_ok=True)
+    js_runtimes = {}
+    try:  # YouTube needs a JavaScript runtime; the app bundles deno
+        import deno
+
+        js_runtimes = {"deno": {"path": deno.find_deno_bin()}}
+    except Exception:
+        pass
+
+    def hook(d):
+        if not progress:
+            return
+        if d.get("status") == "downloading":
+            total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+            frac = (d.get("downloaded_bytes") or 0) / total if total else 0.0
+            progress(0.1 + 0.8 * frac, f"Downloading ({frac:.0%})")
+        elif d.get("status") == "finished":
+            progress(0.92, "Extracting audio")
+
+    whole = s <= 0 and e is None
+    part = "" if whole else f" {int(s)}-{int(e)}s" if e is not None else f" {int(s)}s-end"
+    opts = {
+        "format": "bestaudio/best",
+        "outtmpl": str(folder / f"%(title).60B [%(id)s]{part}.%(ext)s"),
+        "ffmpeg_location": imageio_ffmpeg.get_ffmpeg_exe(),
+        "js_runtimes": js_runtimes,
+        "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "wav"}],
+        "postprocessor_args": {"extractaudio": ["-ac", "1", "-ar", "44100"]},
+        "noplaylist": True,  # a link inside a playlist means that one video
+        "overwrites": True,
+        "windowsfilenames": True,
+        "quiet": True,
+        "no_warnings": True,
+        "noprogress": True,
+        "progress_hooks": [hook],
+    }
+    if not whole:  # only that part is downloaded
+        opts["download_ranges"] = download_range_func(None, [(s, e if e is not None else float("inf"))])
+        opts["force_keyframes_at_cuts"] = True
+    if progress:
+        progress(0.02, "Reading the link")
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        if info.get("_type") == "playlist":  # a playlist link: its first video
+            info = next((x for x in info.get("entries") or [] if x), None) or {}
+        done = info.get("requested_downloads") or []
+        path = Path(done[0]["filepath"]) if done and done[0].get("filepath") else Path(ydl.prepare_filename(info)).with_suffix(".wav")
+    if not path.is_file():
+        raise RuntimeError("Nothing was downloaded (private, removed or region-locked video?).")
+    if progress:
+        progress(1.0, "Download finished")
+    return path, str(info.get("title") or path.stem)

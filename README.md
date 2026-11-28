@@ -4,10 +4,30 @@ A polished Windows WebUI for **local Higgs Audio workflows**: reference voice pr
 
 ---
 
-## 🆕 What's new — 2026-11-24
+## 🆕 What's new — 2026-11-27
+
+### ▶️ Reference voices from YouTube
+- **Inference** and the **Voice Library** editor have a **▶️ From YouTube** box: paste a link (YouTube or any site yt-dlp supports), optionally set **From** / **To** (empty: the link's `?t=` or the start, and up to the end) and **⬇ Download**. The whole video or just that part is downloaded, never cut to a fixed length, as mono WAV in `downloads/references`, and it becomes the reference audio, ready to trim, separate, transcribe and save (the Voice Library also suggests the Sample ID from the video title).
+- **💾 Save to the voice library** in Inference: type a name and save the current reference (audio + transcript, as trimmed or separated) to `samples/`; it becomes the selected library voice. An existing name is never overwritten there.
+- **Live plays in one window only:** the tab where you pressed the button plays the live audio; other tabs or browsers with the app open stay quiet ("playing in another window") instead of playing it again a few milliseconds apart, which sounded like a doubled voice.
+- **Training clips of any length:** the V3 trainer no longer skips clips over 30 s. Training → V3 recipe → *Skip clips longer than* is 0 (no limit) by default, up to 600 s if you want a cap; auto-tune warns when the longest clip may not fit a micro-batch in VRAM.
+- **References of any length:** nothing is cut to 30 s any more. ⚙️ Advanced → ⚗️ Runtime → *Reference length used* (0 = no limit, the default; up to 600 s) sets how much of a reference the model hears; the model's context holds about 20 minutes in total. A longer reference takes a little more time and VRAM.
+- After **🎧 Separate**, the player always reloads with the clean voice, and the note says where it was saved (`outputs/cleaned_refs/`).
+- **Default separation chain everywhere:** `voc_fv7 + gabox_denoise + becruily_karaoke` is preselected in Inference, the Voice Library, Dataset Preparation, Podcast speakers, Dialogue lines and the timeline line dialog.
+
+### 📂 Datasets and training
+- **Min / Max duration** sliders in Dataset Preparation go from 0 to 600 s. Raw audio: longer turns are split, shorter ones dropped.
+- **Ready datasets keep their own lengths:** *Keep the dataset's own lengths (max = the longest clip)* is on by default: every clip is imported as it is, and the max shows the longest clip when the dataset is scanned. Switch it off to drop clips outside Min / Max duration (listed in the build report).
+- **Training → Logging / Save / Eval epochs** next to their steps: save, evaluate or log every N epochs (0.5 = twice per epoch). 0 = use the steps. The V3 trainer turns them into steps at start and says so in the log.
+
+### 🖥 The page
+- **⚙️ Advanced speech settings** shows only on the tabs that make speech: hidden in the Voice Library, Dataset Preparation and Training.
+- **Back where you were after a restart:** every browser tab saves its settings as they change (in `config/session/`, dropped after 3 days unused) and gets them back when that tab reloads, as it does after an app restart. A newly opened tab starts clean. Audio generated before the restart is not kept.
+- **A tab left open across an update stays quiet:** if the app restarts with updated code and an old tab did not notice, that tab pauses (no more errors in the console) and shows a **⟳ Reload** button instead of reloading by force, so you can copy anything first.
+
 
 ### Speech engine: checks, retakes, live playback
-- **⚙️ Advanced speech settings** (one panel shared by every tab, above the console): quality presets (Draft / Standard / Optimal), sampling, long-text mode, seed, and new options:
+- **⚙️ Advanced speech settings** (one panel shared by the tabs that make speech, above the console): quality presets (Draft / Standard / Optimal), sampling, long-text mode, seed, and new options:
   - **Check every take by ear** (CrisperWhisper WER with Strict / Normal / Lenient thresholds), **voice similarity** to the reference (WeSpeaker ResNet34 voice prints), takes per block and retries; the best take is kept.
   - **Sound checks** of every take: runaway / cut-off generation, silence, hum, clipping, little speech, long pauses, noise in pauses, whistle, repeated audio, loudness.
   - **Pauses** between lines of the same / another speaker, **even pauses**, **even loudness**, **room tone** instead of digital silence, final loudness target.
@@ -170,7 +190,7 @@ The GUI follows a complete local voice workflow:
 
 Build a reusable reference voice library.
 
-- Import or record short reference clips.
+- Import or record short reference clips, or download a YouTube video, whole or a part (▶️ From YouTube: link, optional From / To).
 - Trim samples to a clean, stable range.
 - Transcribe with CrisperWhisper 2.0 or write transcripts manually.
 - Save paired audio/transcript samples to `samples/`.

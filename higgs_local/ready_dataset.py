@@ -271,7 +271,7 @@ def describe_ready_source(source: str) -> str:
             lines.append("Skipped: " + ", ".join(notes))
         long_clips = sum(1 for d in durations if d > 30.0)
         if long_clips:
-            lines.append(f"⚠️ {long_clips} clips are longer than 30 s (training skips them by default).")
+            lines.append(f"ℹ️ {long_clips} clips are longer than 30 s: they are trained too, but need more VRAM.")
         if scan.license_files:
             lines.append("License / notes: " + ", ".join(f"`{p.name}`" for p in scan.license_files))
         if extracted:
@@ -298,6 +298,8 @@ def import_ready_dataset(
     clean_options=None,
     use_metadata_split: bool = True,
     progress: Callable[[tuple[int, int] | float, str], None] | None = None,
+    min_sec: float = 0.0,
+    max_sec: float | None = None,
 ) -> tuple[DatasetSummary, str]:
     """Copy a ready dataset into data/<name>/{train,eval}. Returns (summary, report)."""
     dataset_slug = slugify(dataset_name)
@@ -370,6 +372,11 @@ def import_ready_dataset(
                     failed += 1
                     print(f"[dataset-import] Skipped {entry.audio.name}: {exc}", flush=True)
                     continue
+                if duration < float(min_sec or 0.0) or (max_sec and duration > float(max_sec)):
+                    dst.unlink(missing_ok=True)
+                    top = f"{float(max_sec):g}" if max_sec else "no max"
+                    dropped.append(f"{entry.audio.name}: {duration:.1f} s is outside {float(min_sec or 0):g} - {top} s")
+                    continue
                 transcript = normalize_transcript(entry.text)
                 (out_dir / f"{sample_id}.txt").write_text(transcript, encoding="utf-8")
                 sample = _sample_metadata(
@@ -422,6 +429,7 @@ def import_ready_dataset(
         report = [
             f"Imported from: {_clean_path(source)} ({scan.kind})",
             f"Split: {'from metadata' if meta_split else f'{val_split:.0%} evenly spread'}",
+            f"Clip length kept: {float(min_sec or 0):g} s - " + (f"{float(max_sec):g} s" if max_sec else "the longest clip"),
         ]
         if active:
             report.append(
@@ -442,3 +450,17 @@ def import_ready_dataset(
     finally:
         if extracted:
             shutil.rmtree(work_dir, ignore_errors=True)
+
+
+def ready_longest_seconds(source: str) -> float:
+    """Length of the longest clip in a ready dataset (0 when it cannot be read)."""
+    try:
+        work = ROOT / "data" / "_scan_longest"
+        root, extracted = open_ready_source(source, work)
+        try:
+            return float(max(_durations(scan_ready_dataset(root).entries) or [0.0]))
+        finally:
+            if extracted:
+                shutil.rmtree(work, ignore_errors=True)
+    except Exception:
+        return 0.0

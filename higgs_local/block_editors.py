@@ -66,7 +66,7 @@ function rowHtml(b, i) {
   const voices = D.voices || ['None'];
   const loras = D.loras || [['Same as Single voice', '__inherit__']];
   const engines = window.__hvSepEngines || [];
-  const sep = b.audio ? `<span class="dl-sep"><select data-f="sep_engine" title="Separation model or chain">${opts(engines, b.sep_engine || 'voc_fv7+gabox_denoise')}</select>
+  const sep = b.audio ? `<span class="dl-sep"><select data-f="sep_engine" title="Separation model or chain">${opts(engines, b.sep_engine || 'voc_fv7+gabox_denoise+becruily_karaoke')}</select>
       <button class="dl-up" data-act="sep" title="Keep only the voice: remove music, noise or other voices"${b._sepBusy ? ' disabled' : ''}>${b._sepBusy ? '⏳ Separating…' : '🎧 Separate'}</button>
       ${b.audio_orig ? '<button class="dl-up" data-act="unsep" title="Bring back the audio before separation">↩ Original</button>' : ''}</span>` : '';
   const ref = b.audio ? `<audio controls preload="none" src="${esc(b.audio_url)}"></audio><span>${esc(b.audio_name || 'reference')}</span>
@@ -87,7 +87,7 @@ function rowHtml(b, i) {
         <button data-act="dup" title="Clone this line">⧉</button><button data-act="del" class="del" title="Delete">✕</button>
       </div>
     </div>
-    <details class="dl-ref"${b.audio || b._open ? ' open' : ''}><summary>🎙 Own reference audio (optional, wins over the library voice)</summary>
+    <details class="dl-ref"${b.audio || b._open ? ' open' : ''}><summary>🎙 Own reference audio (optional, wins over the library voice · 5–30 s works best)</summary>
       <div class="dl-refbody">${ref}
         <label class="dl-up">📎 ${b.audio ? 'Replace' : 'Upload'} audio<input type="file" accept="audio/*" hidden data-act="upload"></label>
         <input type="text" data-f="ref_text" value="${esc(b.ref_text)}" placeholder="What the reference says (empty: none or the library transcript)">
@@ -127,7 +127,7 @@ root.addEventListener('toggle', (e) => { const b = e.target.tagName === 'DETAILS
 async function separate(b) {
   b._sepBusy = true; b._sepNote = 'Separating the voice… (models download once, 0.2–0.9 GB)'; render();
   try {
-    const r = await server.separate_ref_server(b.audio, b.sep_engine || 'voc_fv7+gabox_denoise');
+    const r = await server.separate_ref_server(b.audio, b.sep_engine || 'voc_fv7+gabox_denoise+becruily_karaoke');
     if (r && r.ok) {
       if (!b.audio_orig) b.audio_orig = { audio: b.audio, audio_url: b.audio_url, audio_name: b.audio_name };
       b.audio = r.path; b.audio_url = r.url; b.audio_name = r.name; b._sepNote = r.note;

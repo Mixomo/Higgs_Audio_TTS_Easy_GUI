@@ -457,3 +457,15 @@ CSS += r'''
 .dark ::-webkit-scrollbar-thumb:hover { background: #33334a; }
 input[type=range] { accent-color: var(--color-accent); }
 '''
+
+CSS += r'''
+/* Advanced speech settings hidden on the tabs that make no speech (Voice Library, Dataset Preparation, Training) */
+.advanced-speech.hv-off { display: none !important; }
+'''
+
+CSS += r'''
+/* banner on a tab left open across an app update */
+.hv-stale { position: fixed; left: 50%; bottom: 18px; transform: translateX(-50%); z-index: 10000; max-width: min(720px, calc(100vw - 32px));
+  padding: 10px 14px; border-radius: 10px; background: #3a2a0c; color: #ffe2a8; border: 1px solid #a8741c; font-size: 14px; box-shadow: 0 6px 24px rgba(0,0,0,.4); }
+.hv-stale button { margin-left: 6px; padding: 3px 10px; border-radius: 6px; border: 1px solid #a8741c; background: #a8741c; color: #1b1205; font-weight: 600; cursor: pointer; }
+'''

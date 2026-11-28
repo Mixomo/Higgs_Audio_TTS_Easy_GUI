@@ -886,7 +886,7 @@ def build_v3_training_command(
     weight_decay: float = 0.01,
     audio_lr_scale: float = 0.1,
     gradient_checkpointing: bool = False,
-    max_audio_seconds: float = 30.0,
+    max_audio_seconds: float = 0.0,  # 0 = no limit
     optimizer: str = "adamw",
     prodigy_d_coef: float = 1.0,
     early_stop_patience: int = 3,
@@ -895,6 +895,9 @@ def build_v3_training_command(
     max_batch_seconds: float = 40.0,
     eval_seed: int = 1234,
     best_only: bool = False,
+    logging_epochs: float = 0.0,
+    save_epochs: float = 0.0,
+    eval_epochs: float = 0.0,
 ) -> tuple[list[str], str]:
     if task_type not in {"single_speaker_smart_voice", "zero_shot_voice_cloning"}:
         raise ValueError("Custom V3 trainer currently supports single_speaker_smart_voice and zero_shot_voice_cloning only.")
@@ -956,6 +959,12 @@ def build_v3_training_command(
         str(float(max_batch_seconds)),
         "--eval_seed",
         str(int(eval_seed)),
+        "--logging_epochs",
+        str(float(logging_epochs or 0.0)),
+        "--save_epochs",
+        str(float(save_epochs or 0.0)),
+        "--eval_epochs",
+        str(float(eval_epochs or 0.0)),
     ]
     if restore_best:
         args.append("--restore_best")

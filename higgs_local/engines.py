@@ -114,7 +114,9 @@ def _ignore_higgs_v3_missing_audio_head():
 
 
 class HiggsV3Engine:
-    REF_MAX_SEC = 30
+    # seconds of the reference the voice is cloned from; 0 = all of it (⚗️ Runtime slider). The model's context
+    # (32k positions, ~25 per second of audio) holds minutes of reference plus the speech to make.
+    REF_MAX_SEC = 0
 
     def __init__(self, model_path: str | Path = V3_MODEL_PATH):
         self.model_path = str(model_path)
@@ -388,16 +390,17 @@ class HiggsV3Engine:
             mtime = os.path.getmtime(path)
         except OSError:
             mtime = 0.0
+        limit = float(self.REF_MAX_SEC or 0)
         hit = self.ref_cache.get(path)
-        if hit and hit[0] == mtime:
+        if hit and hit[0] == (mtime, limit):
             return hit[1], hit[2]
         wav, sr = self._load_ref(path)
-        cap = int(sr * self.REF_MAX_SEC)
-        trimmed = wav.shape[-1] > cap
+        cap = int(sr * limit) if limit > 0 else 0
+        trimmed = bool(cap) and wav.shape[-1] > cap
         if trimmed:
             wav = wav[:cap]
         codes = self.model._encode_reference(wav, sr).cpu()
-        self.ref_cache[path] = (mtime, codes, trimmed)
+        self.ref_cache[path] = ((mtime, limit), codes, trimmed)
         return codes, trimmed
 
     def _modeling_module(self):
@@ -660,7 +663,7 @@ class HiggsV3Engine:
             out.append(wav)
             # Anchor the voice on the first segment when no reference was given.
             if anchor_voice and ref_codes is None and raw is not None and n > 1:
-                max_frames = int(25 * min(20, self.REF_MAX_SEC))
+                max_frames = int(25 * min(20, self.REF_MAX_SEC or 20))
                 if raw.shape[0] >= 25:
                     ref_codes = raw[:max_frames].clone()
                     ref_tx = seg_text if raw.shape[0] <= max_frames else ""
@@ -730,7 +733,7 @@ class HiggsV3Engine:
                 + f"\n[v3-gen-diagnostics] engine=fast text_chars={len(text)} audio_sec={sec:.2f} "
                 f"elapsed={elapsed:.2f}s rtf={elapsed / max(sec, 1e-6):.2f}"
                 + (f" Adapter: {self.loaded_adapter_path}." if self.loaded_adapter_path else "")
-                + (" Reference was trimmed to 30s." if trimmed else "")
+                + (f" Reference was trimmed to {self.REF_MAX_SEC:g} s." if trimmed else "")
             )
         audio = self._generate_stream(text, **kwargs)
         if audio is None:
@@ -768,7 +771,7 @@ class HiggsV3Engine:
             "V3 local Transformers generation complete."
             + f"\n{diagnostics}"
             + (f" Adapter: {self.loaded_adapter_path}." if self.loaded_adapter_path else "")
-            + (" Reference was trimmed to 30s." if trimmed else "")
+            + (f" Reference was trimmed to {self.REF_MAX_SEC:g} s." if trimmed else "")
         )
 
 class HiggsV2Engine:
@@ -1194,6 +1197,10 @@ class ModelManager:
         compile_enabled: bool | None = None,
     ):
         self.v3.set_runtime(precision, attention_backend, compile_enabled)
+
+    def set_ref_max_seconds(self, seconds: float | None):
+        """How much of a reference is used: 0 / None = all of it."""
+        self.v3.REF_MAX_SEC = max(0.0, float(seconds or 0))
 
     def set_v3_adapter(self, adapter_choice: str | None):
         self.v3.set_adapter(adapter_choice)

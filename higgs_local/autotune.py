@@ -161,8 +161,9 @@ def plan_training(prof: DatasetProfile, vram_gb: int = 24, optimizer: str = "ada
     # 6) data quality
     if prof.transcript_coverage is not None and prof.transcript_coverage < 0.95:
         warnings.append(f"{(1 - prof.transcript_coverage) * 100:.0f} % of clips have no transcript file; they will fail to load.")
-    if longest > 30:
-        warnings.append(f"Longest clip is {longest:.0f} s: clips over 30 s are skipped. Rebuild with segmentation (max 15 s) to keep them.")
+    if longest > budget:
+        warnings.append(f"Longest clip is {longest:.0f} s, more than the ~{budget:.0f} s of audio a micro-batch holds on "
+                        f"{vram_gb} GB: it is trained too, but it may run out of VRAM. Batch 1 or segmenting long clips helps.")
     short = sum(1 for d in prof.durations if d < 1.5)
     if short > 0.2 * max(prof.clips, 1):
         warnings.append(f"{short} clips are shorter than 1.5 s: they teach little prosody; consider min segment 2 s.")

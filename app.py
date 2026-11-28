@@ -139,7 +139,7 @@ from higgs_local import takecheck as tc
 from higgs_local import fixer as fx
 from higgs_local import llm, loudness, montage
 from higgs_local.block_editors import DIALOGUE_EDITOR_CSS, DIALOGUE_EDITOR_HTML, DIALOGUE_EDITOR_JS
-from higgs_local.live import LIVE_PLAYER_CSS, LIVE_PLAYER_HTML, LIVE_PLAYER_JS, live_poll
+from higgs_local.live import LIVE_PLAYER_CSS, LIVE_PLAYER_HTML, LIVE_PLAYER_JS, live_claim, live_poll
 from higgs_local.render import (
     LOUDNESS_TARGETS,
     READ_AS_WORDS,
@@ -245,6 +245,56 @@ APP_JS = """
     }
     document.querySelectorAll('.hv-modal[data-hv-open]').forEach((m) => { if (!m.getClientRects().length) delete m.dataset.hvOpen; });
   }).observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['class', 'style'] });
+
+  // ---------------- a tab left open across an app restart that did not notice it (Gradio reloads the ones
+  // that do). Same code: it keeps working. Updated code: it would call the new server's handlers by the old
+  // numbers (wrong inputs, endless errors), so it stops talking to the server and offers a reload, without
+  // forcing one: what is on screen stays to copy from.
+  const cfg0 = window.gradio_config || {};
+  const base = String(cfg0.root || location.origin).replace(/[/]$/, '');
+  const depSig = (c) => JSON.stringify((c.dependencies || []).map((d) => [d.id, d.targets, d.inputs, d.outputs]));
+  let bootId = String(cfg0.app_id || ''), stale = false;
+  const mySig = depSig(cfg0);
+  const realFetch = window.fetch.bind(window);
+  window.fetch = (input, init) => {
+    const url = String((input && input.url) || input || '');
+    if (stale && url.includes('/gradio_api/') && !url.includes('/file=')) {
+      return Promise.reject(new Error('This tab is from before the app was updated: reload it.'));
+    }
+    return realFetch(input, init);
+  };
+  if (bootId) {
+    setInterval(async () => {
+      if (stale) return;
+      try {
+        const r = await realFetch(base + '/gradio_api/app_id', { cache: 'no-store' });
+        if (!r.ok) return;
+        const now = String((await r.json()).app_id || '');
+        if (!now || now === bootId) return;
+        const c = await (await realFetch(base + '/config', { cache: 'no-store' })).json();
+        if (depSig(c) === mySig) { bootId = now; return; }  // restarted with the same code: carry on
+        stale = true;
+        const bar = document.createElement('div');
+        bar.className = 'hv-stale';
+        bar.innerHTML = '⚠️ The app was restarted with updated code. This tab is paused so it does not call the wrong '
+          + 'functions; copy anything you need, then <button type="button">⟳ Reload</button>';
+        bar.querySelector('button').onclick = () => location.reload();
+        document.body.appendChild(bar);
+      } catch (e) { /* server down or restarting: try again later */ }
+    }, 3000);
+  }
+
+  // ---------------- the speech settings only where speech is made (not in Voice Library, Dataset, Training)
+  const NO_SPEECH = ['Voice Library', 'Dataset Preparation', 'Training'];
+  const syncAdvanced = () => {
+    const tab = document.querySelector('.main-tabs [role=tab][aria-selected=true]');
+    const adv = document.querySelector('.advanced-speech');
+    if (!tab || !adv) return;
+    const hide = NO_SPEECH.some((n) => tab.textContent.includes(n));
+    if (adv.classList.contains('hv-off') !== hide) adv.classList.toggle('hv-off', hide);
+  };
+  new MutationObserver(syncAdvanced).observe(document.body, { subtree: true, attributes: true, attributeFilter: ['aria-selected'] });
+  setTimeout(syncAdvanced, 500);
 
   // ---------------- @ tag autocomplete (Inference script, dialogue lines, eval / compare texts)
   const CATALOG = __TAG_CATALOG__;
@@ -570,6 +620,20 @@ def v3_compile_default() -> bool:
     return bool(_load_ui_settings().get("v3_torch_compile", False))
 
 
+def ref_max_default() -> float:
+    try:
+        return max(0.0, float(_load_ui_settings().get("v3_ref_max_sec", 0)))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def set_ref_max(seconds):
+    seconds = max(0.0, float(seconds or 0))
+    _save_ui_settings(v3_ref_max_sec=seconds)
+    MANAGER.set_ref_max_seconds(seconds)
+    return log("Reference length: " + (f"the first {seconds:g} s are used." if seconds else "no limit, the whole reference is used."))
+
+
 def log(message: str) -> str:
     LOG_LINES.append(message)
     del LOG_LINES[:-250]
@@ -839,8 +903,8 @@ def compare_checkpoints(project, adapters, text, voice, seed, temperature, progr
         ):
             if isinstance(update[1], str):
                 last_file = update[1]
-            if isinstance(update[3], str):
-                last_console = update[3]
+            if isinstance(update[2], str):
+                last_console = update[2]
         if last_file and Path(last_file).exists():
             dst = out_dir / f"{n:02d}_{safe_name(label, 'checkpoint')[:60]}.wav"
             shutil.copyfile(last_file, dst)
@@ -1421,11 +1485,10 @@ def run_inference(
     started = time.perf_counter()
 
     def out(audio=None, file=None, console=None, busy=True, bar=None, blocks=None):
-        """One UI update for the 8 inference outputs."""
+        """One UI update for the 7 inference outputs (the script is not one: it stays editable while generating)."""
         return (
             gr.update() if audio is None else audio,
             gr.update() if file is None else file,
-            text,
             gr.update() if console is None else console,
             set_button_busy("Generating…") if busy else restore_button("⚡ Generate Speech"),
             gr.update(interactive=busy),
@@ -1791,20 +1854,53 @@ def save_sample_ui(audio_path, sample_name, transcript):
     return [*result[:-1], mini_log(status), restore_button("💾 Save Sample")]
 
 
+def infer_save_to_library(audio_path, name, transcript):
+    """Inference: keep the current reference (audio + transcript) as a library voice and pick it.
+
+    Returns (Voice Library dropdown, Inference voice dropdown, status). An existing voice is never overwritten here."""
+    from higgs_local.audio_utils import safe_name
+
+    keep = gr.update(), gr.update()
+    if not audio_path or not Path(str(audio_path)).is_file():
+        gr.Warning("Load or record a reference audio first.")
+        return *keep, "No reference audio to save."
+    if not (name or "").strip():
+        gr.Warning("Type a name for the voice.")
+        return *keep, "Type a name for the voice."
+    clean = safe_name(name, "voice")
+    taken = {n.lower() for n in list_voice_names()}
+    if clean.lower() in taken:
+        gr.Warning(f"“{clean}” is already in the library.")
+        return *keep, f"❌ **{clean}** is already in the library: pick another name (or overwrite it in 🎙️ Voice Library)."
+    status = save_voice_sample(audio_path, clean, transcript)
+    if not status.startswith("Saved voice sample: "):
+        return *keep, f"❌ {status}"
+    dest = SAMPLES_DIR / status.split(": ", 1)[1].strip()
+    if loudness.normalize_file(dest):
+        status += f" · loudness {loudness.SETTINGS['target']:g} LUFS"
+    log(status)
+    choices = list_voice_names()
+    note = f"✅ Saved as **{dest.stem}** in `{_rel(dest)}`" + ("" if (transcript or "").strip() else " (no transcript)") +         ": it is now the selected library voice."
+    return gr.update(choices=choices), gr.update(choices=choices, value=dest.stem), note
+
+
 CLEANED_REFS_DIR = OUTPUTS_DIR / "cleaned_refs"
 REF_CLEAN_ENGINES = [(label, key) for label, key in CLEAN_ENGINES if key != "off"]
+# the default chain in Inference, the Voice Library and Dataset Preparation: voice, then noise, then only the lead voice
+DEFAULT_SEP_CHAIN = "voc_fv7+gabox_denoise+becruily_karaoke"
 
 
 def clean_reference_audio(audio_path, engine, original, progress=gr.Progress(track_tqdm=False)):
     """Separate the voice from music, noise or other voices in a reference clip (any engine or chain).
 
-    Returns (cleaned audio, original path kept for ↩, status). The clip keeps its sample rate; mono."""
+    Returns (cleaned audio or None, original path kept for ↩, status). The clip keeps its sample rate; mono.
+    The player is then emptied and loaded with the cleaned file (see the wiring), so its waveform is always redrawn."""
     if not audio_path or not Path(str(audio_path)).is_file():
         gr.Warning("Load a reference audio first.")
-        return gr.update(), original, "No audio to clean."
+        return None, original, "No audio to clean."
     engine = str(engine or "").strip()
     if not engine or engine == "off":
-        return gr.update(), original, "Pick a separation model."
+        return None, original, "Pick a separation model."
     import soundfile as sf
 
     from higgs_local.dataset_audio import DatasetAudioProcessor, _mono
@@ -1816,9 +1912,9 @@ def clean_reference_audio(audio_path, engine, original, progress=gr.Progress(tra
     except Exception as exc:
         gr.Warning(f"Separation failed: {exc}")
         print(f"[clean] {src.name}: {exc}", flush=True)
-        return gr.update(), original, f"❌ {exc}"
+        return None, original, f"❌ {exc}"
     keep = original if original and Path(str(original)).is_file() else str(src)
-    return str(dst), keep, note + " ↩ brings back the original."
+    return str(dst), keep, f"{note} The player now holds the clean voice, saved as `{_rel(dst)}`. ↩ brings back the original."
 
 
 def _engine_label(engine: str) -> str:
@@ -1850,8 +1946,15 @@ def separate_file(src: Path, engine: str) -> tuple[Path, str]:
         finally:
             proc.unload()
     note = f"✅ {_engine_label(engine)} · {len(clean) / sr:.1f} s in {time.time() - t0:.1f} s."
-    print(f"[clean] {src.name}: {note}", flush=True)
+    print(f"[clean] {src.name}: {note} → {dst}", flush=True)
     return dst, note
+
+
+def _rel(path) -> str:
+    try:
+        return Path(path).resolve().relative_to(ROOT).as_posix()
+    except ValueError:
+        return str(path)
 
 
 def separate_ref_server(*args):
@@ -2374,7 +2477,8 @@ def auto_tune_training_from_dataset(train_data_dir, eval_data_dir="", vram_prese
             if sample_count < 20:
                 warnings_list.append("Very small dataset; high overfit risk. Watch eval loss and use the Best eval checkpoint.")
             if analysis.max_duration is not None and analysis.max_duration > 30:
-                warnings_list.append("Clips over 30 s are skipped by the V3 trainer; rebuild the dataset with segmentation on.")
+                warnings_list.append(f"Longest clip is {analysis.max_duration:.0f} s: it is trained too, but long clips need "
+                                     "more VRAM (batch 1 and gradient checkpointing help).")
             if not eval_data_dir:
                 warnings_list.append("No validation dataset selected: no eval loss and no Best eval checkpoint.")
             report = _format_autotune_report(analysis, vram_preset or "24 GB VRAM", settings, warnings_list)
@@ -2726,6 +2830,57 @@ def clip_import_block(label="📥 Import audio + transcript from a dataset"):
     return ds, folder_btn, refresh_btn, clip, file_btn, status
 
 
+def youtube_clip_block(label="▶️ From YouTube (or any link yt-dlp supports)"):
+    """Link + From / To fields that download one part of a video as the reference audio. Returns its components."""
+    with gr.Accordion(label, open=False):
+        url = gr.Textbox(label="Video link", placeholder="https://www.youtube.com/watch?v=…  (a ?t=90 link starts there)",
+                         lines=1)
+        with gr.Row(equal_height=True):
+            start = gr.Textbox(label="From (optional)", placeholder="1:20 · empty: the link's t= or the start", scale=2,
+                               min_width=120)
+            end = gr.Textbox(label="To (optional)", placeholder="1:45 · empty: to the end", scale=2, min_width=120)
+            btn = gr.Button("⬇ Download", variant="secondary", scale=1, min_width=120)
+        status = gr.Markdown("The whole video, or only From → To, as mono WAV in `downloads/references`; nothing is "
+                             "cut to a fixed length. Then trim, separate and transcribe it like any other clip.",
+                             elem_classes="hint")
+    return url, start, end, btn, status
+
+
+def youtube_clip_ui(url, start, end, progress=gr.Progress(track_tqdm=False)):
+    """Download one clip into the reference player. Returns (audio, transcript, original for ↩, status, name)."""
+    from higgs_local.training_utils import slugify
+    from higgs_local.youtube import download_clip
+
+    if not (url or "").strip():
+        gr.Warning("Paste a video link first.")
+        return gr.update(), gr.update(), gr.update(), "Paste a video link first.", gr.update()
+    try:
+        path, title = download_clip(url, start, end, progress=lambda f, d: progress(f, desc=d))
+    except Exception as exc:
+        msg = str(exc).replace("ERROR: ", "")
+        gr.Warning(f"Download failed: {msg[:200]}")
+        print(f"[youtube] {url}: {msg}", flush=True)
+        return gr.update(), gr.update(), gr.update(), f"❌ {msg}", gr.update()
+    import soundfile as sf
+
+    seconds = sf.info(str(path)).duration
+    print(f"[youtube] {title}: {seconds:.1f} s → {path}", flush=True)
+    note = f"✅ **{title}** · {seconds:.1f} s, saved as `{_rel(path)}`. Transcribe it (the old transcript was cleared)."
+    return str(path), "", None, note, slugify(title, fallback="youtube_voice")[:40]
+
+
+def wire_youtube_clip(parts, audio_out, text_out, orig_state, name_out=None):
+    url, start, end, btn, status = parts
+    outputs = [audio_out, text_out, orig_state, status] + ([name_out] if name_out is not None else [])
+
+    def run(u, s, e, progress=gr.Progress(track_tqdm=False)):
+        result = youtube_clip_ui(u, s, e, progress)
+        return result if name_out is not None else result[:4]
+
+    for trigger in (btn.click, url.submit):
+        trigger(run, [url, start, end], outputs, concurrency_limit=1, concurrency_id="youtube_clip")
+
+
 def wire_clip_import(parts, audio_out, text_out, name_out=None):
     ds, folder_btn, refresh_btn, clip, file_btn, status = parts
     outputs = [audio_out, text_out, status] + ([name_out] if name_out is not None else [])
@@ -2804,6 +2959,7 @@ def prepare_higgs_dataset(
     align_text=True,
     align_drop=True,
     youtube_urls="",
+    ready_auto_max=True,
     progress=gr.Progress(track_tqdm=False),
 ):
     try:
@@ -2834,6 +2990,9 @@ def prepare_higgs_dataset(
                 ),
                 use_metadata_split=bool(ready_use_split),
                 progress=lambda fraction, desc: progress(fraction, desc=desc),
+                # on (default): the dataset's own lengths are kept as they are; off: the sliders filter it
+                min_sec=0.0 if ready_auto_max else float(min_segment_sec or 0.0),
+                max_sec=None if ready_auto_max else float(max_segment_sec),
             )
             summary, align_report = _align_dataset_step(summary, asr_language, align_text, align_drop, progress)
             return _dataset_build_done(
@@ -2848,6 +3007,9 @@ def prepare_higgs_dataset(
                     "ready_vad_trim": bool(ready_vad_trim),
                     "ready_min_speech": float(ready_min_speech or 0.0),
                     "ready_normalize": bool(ready_normalize),
+                    "ready_auto_max": bool(ready_auto_max),
+                    "min_sec": float(min_segment_sec or 0.0),
+                    "max_sec": float(max_segment_sec),
                     "clean_engine": clean_engine,
                     "language": asr_language,
                     "val_split": float(val_split),
@@ -3196,7 +3358,7 @@ def start_higgs_training(
     v3_train_audio_modules=False,
     v3_audio_lr_scale=0.1,
     v3_grad_ckpt=False,
-    v3_max_clip=30,
+    v3_max_clip=0,
     v3_optimizer="adamw",
     v3_prodigy_dcoef=1.0,
     v3_patience=3,
@@ -3204,6 +3366,9 @@ def start_higgs_training(
     v3_restore_best=True,
     v3_max_batch_sec=40,
     v3_best_only=False,
+    logging_epochs=0.0,
+    save_epochs=0.0,
+    eval_epochs=0.0,
 ):
     global LAST_TRAINING_DONE_KEY
     LAST_TRAINING_DONE_KEY = None
@@ -3276,6 +3441,9 @@ def start_higgs_training(
                 "restore_best": bool(v3_restore_best),
                 "max_batch_seconds": float(v3_max_batch_sec),
                 "best_only": bool(v3_best_only),
+                "logging_epochs": float(logging_epochs or 0.0),
+                "save_epochs": float(save_epochs or 0.0),
+                "eval_epochs": float(eval_epochs or 0.0),
             }
             save_project_config(output_name or "higgs_v3_lora", "Higgs V3 TTS", project_args, resume_checkpoint or "")
             cmd, pretty = build_v3_training_command(
@@ -3313,6 +3481,9 @@ def start_higgs_training(
                 restore_best=bool(v3_restore_best),
                 max_batch_seconds=float(v3_max_batch_sec or 40),
                 best_only=bool(v3_best_only),
+                logging_epochs=float(logging_epochs or 0.0),
+                save_epochs=float(save_epochs or 0.0),
+                eval_epochs=float(eval_epochs or 0.0),
             )
             status, tail = TRAINING.start(cmd, output_name or "higgs_v3_lora")
             message = (
@@ -4818,6 +4989,18 @@ def load_gui_preset(names: list[str], comps: list, name):
     except Exception as exc:
         gr.Warning(f"The preset “{name}” could not be read: {exc}")
         return [gr.update() for _ in names]
+    updates, problems = _apply_preset_values(names, comps, values)
+    if problems:
+        shown = "; ".join(problems[:8]) + (f" … and {len(problems) - 8} more" if len(problems) > 8 else "")
+        gr.Warning(f"Preset “{name}” loaded, with things that are gone kept as they were: {shown}")
+        print(f"[preset] {name}: " + " | ".join(problems), flush=True)
+    else:
+        gr.Info(f"Preset “{name}” loaded.")
+    return updates
+
+
+def _apply_preset_values(names: list[str], comps: list, values: dict) -> tuple[list, list[str]]:
+    """Updates that put saved values back; whatever is gone (a voice, a LoRA, a file) is skipped and reported."""
     voices = set(list_voice_names())
     problems: list[str] = []
     updates = []
@@ -4861,13 +5044,63 @@ def load_gui_preset(names: list[str], comps: list, name):
         except Exception as exc:  # one bad value never stops the rest
             problems.append(f"{key}: {exc}")
             updates.append(gr.update())
+    return updates, problems
+
+
+# ---------------------------------------------------------------- the page's settings across reloads
+# Each browser tab keeps its own id (sessionStorage: it survives a reload of that tab, a new tab gets a new one).
+# Its settings are saved whenever one changes; a reload of the same tab (after an app restart, say) puts them back.
+# A freshly opened tab starts clean.
+SESSION_DIR = ROOT / "config" / "session"
+SESSION_KEEP_DAYS = 3
+
+
+def _session_path(tab) -> Path | None:
+    tab = str(tab or "")
+    if not re.fullmatch(r"[0-9a-fA-F-]{8,40}", tab):
+        return None
+    return SESSION_DIR / f"{tab}.json"
+
+
+def session_autosave(names: list[str], tab, *values):
+    path = _session_path(tab)
+    if path is None:
+        return
+    data = {k: v for k, v in zip(names, values) if isinstance(v, (str, int, float, bool, list, dict)) or v is None}
+    text = json.dumps({"version": 1, "values": data}, ensure_ascii=False)
+    try:
+        if path.is_file() and path.read_text(encoding="utf-8") == text:
+            return
+        SESSION_DIR.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    except Exception as exc:
+        print(f"[session] could not save this tab's settings: {exc}", flush=True)
+
+
+def session_restore(names: list[str], comps: list, tab):
+    path = _session_path(tab)
+    if path is None or not path.is_file():
+        return [gr.update() for _ in names]
+    try:
+        values = json.loads(path.read_text(encoding="utf-8")).get("values", {})
+    except Exception:
+        return [gr.update() for _ in names]
+    updates, problems = _apply_preset_values(names, comps, values)
     if problems:
-        shown = "; ".join(problems[:8]) + (f" … and {len(problems) - 8} more" if len(problems) > 8 else "")
-        gr.Warning(f"Preset “{name}” loaded, with things that are gone kept as they were: {shown}")
-        print(f"[preset] {name}: " + " | ".join(problems), flush=True)
-    else:
-        gr.Info(f"Preset “{name}” loaded.")
+        print("[session] restored, skipping: " + " | ".join(problems), flush=True)
+    gr.Info("Back where you were: this tab's settings are restored.")
     return updates
+
+
+def session_cleanup():
+    """Drop the saved settings of tabs not used for a few days."""
+    cutoff = time.time() - SESSION_KEEP_DAYS * 86400
+    for f in SESSION_DIR.glob("*.json") if SESSION_DIR.is_dir() else []:
+        try:
+            if f.stat().st_mtime < cutoff:
+                f.unlink()
+        except OSError:
+            pass
 
 
 def _preset_editor_value(key: str, value, problems: list[str]):
@@ -5059,6 +5292,8 @@ def build_ui():
     inference_default_sample = "None"
     saved_v3_compile = v3_compile_default()
     MANAGER.set_v3_runtime("auto", "sdpa", saved_v3_compile)
+    MANAGER.set_ref_max_seconds(ref_max_default())
+    session_cleanup()
 
     with gr.Blocks(title=APP_TITLE, fill_width=True) as demo:
         with gr.Row(equal_height=True):
@@ -5069,7 +5304,7 @@ def build_ui():
             gr.Button("📖 Higgs Audio docs", size="sm", variant="secondary", scale=0, link="https://github.com/boson-ai/higgs-audio")
             gr.HTML(LIVE_PLAYER_HTML, css_template=LIVE_PLAYER_CSS,
                     js_on_load=LIVE_PLAYER_JS + "\nwindow.__hvTagOptions = (m) => server.voice_tag_options(m);",
-                    server_functions=[live_poll, voice_tag_options],
+                    server_functions=[live_poll, live_claim, voice_tag_options],
                     elem_id="live-player", scale=0, min_width=220)
             top_live = gr.Checkbox(value=True, label="📡 Live", container=False, scale=0, min_width=90,
                                    elem_classes=["top-live"],
@@ -5203,8 +5438,9 @@ def build_ui():
                                     )
                                     refresh_infer_sample_btn = gr.Button("🔄", scale=1, min_width=48, variant="secondary")
                                 infer_import_parts = clip_import_block("📥 Use a clip from a dataset or folder (audio + .txt)")
+                                infer_youtube_parts = youtube_clip_block()
                                 infer_ref_audio = gr.Audio(
-                                    label="Reference audio · 5–30 s",
+                                    label="Reference audio · 5–30 s works best",
                                     type="filepath",
                                     value=None,
                                     sources=["upload", "microphone"],
@@ -5212,7 +5448,7 @@ def build_ui():
                                 )
                                 with gr.Accordion("🎧 Separate the voice (music, noise, other voices)", open=False):
                                     with gr.Row(equal_height=True):
-                                        infer_clean_engine = gr.Dropdown(REF_CLEAN_ENGINES, value="voc_fv7+gabox_denoise",
+                                        infer_clean_engine = gr.Dropdown(REF_CLEAN_ENGINES, value=DEFAULT_SEP_CHAIN,
                                                                           label="Separation model or chain", scale=5)
                                         infer_clean_btn = gr.Button("🎧 Separate", variant="secondary", scale=1, min_width=110)
                                         infer_clean_undo = gr.Button("↩ Original", variant="secondary", scale=1, min_width=100)
@@ -5246,6 +5482,14 @@ def build_ui():
                                     "Turning the transcript off can sound more expressive when the reference already carries strong emotion.",
                                     elem_classes="hint",
                                 )
+                                with gr.Accordion("💾 Save to the voice library", open=False):
+                                    with gr.Row(equal_height=True):
+                                        infer_save_name = gr.Textbox(label="Voice name", placeholder="e.g. news_anchor_1",
+                                                                     scale=4)
+                                        infer_save_btn = gr.Button("💾 Save", variant="primary", scale=1, min_width=110)
+                                    infer_save_note = gr.Markdown(
+                                        "Saves the reference audio above with its transcript (as they are now: trimmed, "
+                                        "separated) to `samples/`, and selects it.", elem_classes="hint")
 
                             with gr.Column(min_width=320, elem_classes=["card", "studio-settings"]):
                                 gr.HTML(section("Settings"))
@@ -5351,12 +5595,12 @@ def build_ui():
                                                    label="Pause before (ms)", placeholder="auto",
                                                    info="Before each line of this speaker; empty: the podcast pauses.")
                                 with gr.Accordion("🎙 Own reference audio (optional, wins over the library voice)", open=False):
-                                    pa = gr.Audio(label="Reference audio · 5–30 s", type="filepath",
+                                    pa = gr.Audio(label="Reference audio · 5–30 s works best", type="filepath",
                                                   sources=["upload", "microphone"], elem_classes=["audio-safe-space"])
                                     pt = gr.Textbox(label="Reference transcript", lines=1,
                                                     placeholder="What the reference says (empty: no transcript)")
                                     with gr.Row(equal_height=True):
-                                        pse = gr.Dropdown(REF_CLEAN_ENGINES, value="voc_fv7+gabox_denoise", scale=5,
+                                        pse = gr.Dropdown(REF_CLEAN_ENGINES, value=DEFAULT_SEP_CHAIN, scale=5,
                                                           label="🎧 Separate the voice from music, noise or other voices")
                                         psb = gr.Button("🎧 Separate", variant="secondary", scale=1, min_width=110)
                                         psu = gr.Button("↩ Original", variant="secondary", scale=1, min_width=100)
@@ -5501,8 +5745,9 @@ def build_ui():
                     with gr.Column(scale=2, elem_classes="card"):
                         gr.HTML(section("Editor"))
                         prep_import_parts = clip_import_block("📥 Import from a dataset or folder (audio + .txt)")
+                        prep_youtube_parts = youtube_clip_block()
                         prep_audio_player = gr.Audio(
-                            label="Audio · 5–30 s recommended (use the trim icon to edit)",
+                            label="Audio · 5–30 s works best (trim with the ✂ icon)",
                             type="filepath",
                             interactive=True,
                             value=None,
@@ -5510,7 +5755,7 @@ def build_ui():
                             elem_classes=["audio-safe-space"],
                         )
                         with gr.Row(equal_height=True):
-                            prep_clean_engine = gr.Dropdown(REF_CLEAN_ENGINES, value="voc_fv7+gabox_denoise",
+                            prep_clean_engine = gr.Dropdown(REF_CLEAN_ENGINES, value=DEFAULT_SEP_CHAIN,
                                                             label="🎧 Separate the voice from music, noise or other voices",
                                                             scale=5)
                             prep_clean_btn = gr.Button("🎧 Separate", variant="secondary", scale=1, min_width=110)
@@ -5641,7 +5886,7 @@ def build_ui():
                         gr.Markdown("#### 🎧 Clean-up & Segmentation")
                         dataset_isolate = gr.Dropdown(
                             CLEAN_ENGINES,
-                            value="inworld",
+                            value=DEFAULT_SEP_CHAIN,
                             label="Voice clean-up / separation",
                             info="Removes music, noise or background voices. RoFormer models download once (~0.2–0.9 GB each).",
                         )
@@ -5651,10 +5896,15 @@ def build_ui():
                                 value=True,
                                 info="Voice-activity + end-of-turn model; long turns are cut at the deepest pause.",
                             )
-                            with gr.Row():
-                                dataset_min_sec = gr.Slider(1.0, 8.0, value=2.0, step=0.5, label="Min segment (s)")
-                                dataset_max_sec = gr.Slider(6.0, 25.0, value=15.0, step=0.5, label="Max segment (s)")
+                        with gr.Row():
+                            dataset_min_sec = gr.Slider(0.0, 600.0, value=2.0, step=0.5, label="Min duration (s)", info="Shorter clips are dropped.")
+                            dataset_max_sec = gr.Slider(1.0, 600.0, value=15.0, step=0.5, label="Max duration (s)", info="Raw audio: longer turns are split. Ready dataset: only used when 'Keep the dataset's own lengths' is off.")
                         with gr.Group(visible=False) as ready_clean_group:
+                            ready_auto_max = gr.Checkbox(
+                                label="Keep the dataset's own lengths (max = the longest clip)",
+                                value=True,
+                                info="Every clip is kept as it is; the max shows the longest clip when scanned. Off: clips outside Min / Max duration are dropped.",
+                            )
                             ready_vad_trim = gr.Checkbox(
                                 label="Trim edge silence (SAVA voice activity)",
                                 value=True,
@@ -5743,10 +5993,16 @@ def build_ui():
                         lora_rank = gr.Number(value=DEFAULT_TRAINING_24GB["lora_rank"], precision=0, label="LoRA Rank")
                         use_lora = gr.Checkbox(label="Use LoRA", value=True)
                         bf16_train = gr.Checkbox(label="bf16 mixed precision", value=DEFAULT_TRAINING_24GB["bf16"])
-                        with gr.Row():
-                            train_logging_steps = gr.Number(value=DEFAULT_TRAINING_24GB["logging_steps"], precision=0, label="Logging steps")
-                            train_save_steps = gr.Number(value=DEFAULT_TRAINING_24GB["save_steps"], precision=0, label="Save steps")
-                            train_eval_steps = gr.Number(value=DEFAULT_TRAINING_24GB["eval_steps"], precision=0, label="Eval steps")
+                        with gr.Column():
+                            with gr.Row():
+                                train_logging_steps = gr.Number(value=DEFAULT_TRAINING_24GB["logging_steps"], precision=0, label="Logging steps", min_width=90)
+                                train_logging_epochs = gr.Number(value=0, minimum=0, step=0.5, label="Logging epochs", info="0 = use the steps · V3 only", min_width=90)
+                            with gr.Row():
+                                train_save_steps = gr.Number(value=DEFAULT_TRAINING_24GB["save_steps"], precision=0, label="Save steps", min_width=90)
+                                train_save_epochs = gr.Number(value=0, minimum=0, step=0.5, label="Save epochs", info="0 = use the steps · V3 only", min_width=90)
+                            with gr.Row():
+                                train_eval_steps = gr.Number(value=DEFAULT_TRAINING_24GB["eval_steps"], precision=0, label="Eval steps", min_width=90)
+                                train_eval_epochs = gr.Number(value=0, minimum=0, step=0.5, label="Eval epochs", info="0 = use the steps · V3 only", min_width=90)
                         with gr.Row():
                             resume_checkpoint_choice = gr.Dropdown(
                                 choices=["None"],
@@ -5802,7 +6058,9 @@ def build_ui():
                         )
                         v3_audio_lr_scale = gr.Number(value=0.1, label="Codec embedding LR × (when trained)")
                         v3_grad_ckpt = gr.Checkbox(label="Gradient checkpointing", value=False, info="Less VRAM, ~30% slower.")
-                        v3_max_clip = gr.Slider(8, 40, value=30, step=1, label="Skip clips longer than (s)")
+                        v3_max_clip = gr.Slider(0, 600, value=0, step=5, label="Skip clips longer than (s) · 0 = no limit",
+                                                info="Every clip is trained by default. Long clips need more VRAM: "
+                                                     "batch 1 and gradient checkpointing help.")
                     gr.Markdown("**Anti-overfitting**", elem_classes="hint")
                     with gr.Row():
                         v3_min_delta = gr.Number(
@@ -5986,7 +6244,8 @@ def build_ui():
                         [cmp_status, cmp_results],
                     )
 
-        with gr.Accordion("⚙️ Advanced speech settings · shared by every tab", open=False, elem_classes=["accordion", "advanced-speech"]):
+        with gr.Accordion("⚙️ Advanced speech settings · shared by every tab", open=False,
+                          elem_classes=["accordion", "advanced-speech"]) as adv_accordion:
             with gr.Accordion("📏 Long text & seed", open=False):
                 infer_chunk_mode = gr.Dropdown(
                     CHUNK_CHOICES,
@@ -6093,6 +6352,12 @@ def build_ui():
                     value=saved_v3_compile,
                     info="Not needed on the fast engine. First run can take minutes to compile.",
                 )
+                v3_ref_max = gr.Slider(
+                    0, 600, value=ref_max_default(), step=5,
+                    label="Reference length used (s) · 0 = no limit",
+                    info="How much of a reference voice the model hears. 0 uses all of it (the model holds ~20 min "
+                         "in total); a longer reference takes a bit more time and VRAM. Applies to the next generation.",
+                )
             with gr.Accordion("🏁 Presets", open=True):
                 with gr.Row(equal_height=True):
                     adv_quality = gr.Radio(
@@ -6143,7 +6408,8 @@ def build_ui():
                     choices=[(label, key) for key, label in tc.SOUND_CHECKS.items()],
                     value=list(tc.CHEAP_CHECKS),
                     label="Sound checks of every take",
-                    info="A defect redoes the take, a suspect is decided by ASR, a note is only shown. The last two are slower.",
+                    info="A defect redoes the take; a suspect is decided by ASR when “Check every new take by ear” is on, "
+                         "otherwise it is only shown, like a note. The last two are slower.",
                 )
             with gr.Accordion("⏸ Pauses & finishing", open=False):
                 with gr.Row(equal_height=True):
@@ -6243,6 +6509,7 @@ def build_ui():
             return q["asr_check"], q["takes"], q["similarity"], q["strictness"]
 
         adv_quality.input(apply_quality, adv_quality, [adv_asr_check, adv_takes, adv_similarity, adv_strictness], queue=False)
+
         for comp in (adv_asr_check, adv_takes, adv_similarity, adv_strictness):
             comp.input(lambda: "Custom", None, adv_quality, queue=False)
         adv_sampling_defaults_btn.click(lambda: (0.8, 50, 0.95), None, [infer_temperature, infer_top_k, infer_top_p], queue=False)
@@ -6301,13 +6568,22 @@ def build_ui():
             (prep_audio_player, prep_clean_engine, prep_clean_btn, prep_clean_undo, prep_clean_orig, prep_clean_note),
             *pc_sep_parts,
         ):
-            _btn.click(clean_reference_audio, [_src, _eng, _orig], [_src, _orig, _note], concurrency_limit=1,
-                       concurrency_id="ref_clean")
+            _clean = gr.State(None)  # the cleaned file: the player is emptied, then loaded with it (always redrawn)
+            _btn.click(clean_reference_audio, [_src, _eng, _orig], [_clean, _orig, _note], concurrency_limit=1,
+                       concurrency_id="ref_clean").then(
+                lambda p: None if p else gr.update(), _clean, _src, queue=False, show_progress="hidden").then(
+                lambda p: p or gr.update(), _clean, _src, queue=False, show_progress="hidden")
             _undo.click(restore_reference_audio, _orig, [_src, _orig, _note], queue=False)
         infer_sample_select.change(lambda: None, None, infer_clean_orig, queue=False)
         sample_dropdown.change(lambda: None, None, prep_clean_orig, queue=False)
         wire_clip_import(infer_import_parts, infer_ref_audio, infer_ref_text)
         wire_clip_import(prep_import_parts, prep_audio_player, prep_transcription, save_sample_name)
+        wire_youtube_clip(infer_youtube_parts, infer_ref_audio, infer_ref_text, infer_clean_orig, infer_save_name)
+        for trigger in (infer_save_btn.click, infer_save_name.submit):
+            trigger(infer_save_to_library, [infer_ref_audio, infer_save_name, infer_ref_text],
+                    [sample_dropdown, infer_sample_select, infer_save_note], queue=False).then(
+                dialogue_sync, [dialogue_editor, infer_model_select], dialogue_editor, queue=False)
+        wire_youtube_clip(prep_youtube_parts, prep_audio_player, prep_transcription, prep_clean_orig, save_sample_name)
         infer_ref_transcribe_start = infer_transcribe_ref_btn.click(
             lambda: (set_button_busy("Transcribing... check the console"), gr.update(interactive=True), "Transcribing reference audio..."),
             None,
@@ -6366,7 +6642,7 @@ def build_ui():
                 infer_carry_tags,
                 *adv_inputs,
             ],
-            [infer_audio_out, infer_file_out, infer_text, infer_console, infer_gen_btn, infer_stop_btn, infer_progress, infer_blocks],
+            [infer_audio_out, infer_file_out, infer_console, infer_gen_btn, infer_stop_btn, infer_progress, infer_blocks],
             show_progress="hidden",
         )
         infer_stop_btn.click(
@@ -6519,6 +6795,17 @@ def build_ui():
         ready_browse_zip_btn.click(lambda cur: browse_ready_dataset("zip", cur), ready_path, [ready_path, ready_scan_md], queue=False)
         ready_scan_btn.click(describe_ready_dataset, ready_path, ready_scan_md, queue=False)
         ready_path.submit(describe_ready_dataset, ready_path, ready_scan_md, queue=False)
+
+        def ready_max_to_longest(path, auto):
+            if not auto or not (path or "").strip():
+                return gr.update()
+            from higgs_local.ready_dataset import ready_longest_seconds
+
+            longest = ready_longest_seconds(path)
+            return gr.update(value=min(600.0, math.ceil(longest * 2) / 2)) if longest > 0 else gr.update()
+
+        ready_scan_md.change(ready_max_to_longest, [ready_path, ready_auto_max], dataset_max_sec, show_progress="hidden")
+        ready_auto_max.change(ready_max_to_longest, [ready_path, ready_auto_max], dataset_max_sec, show_progress="hidden")
         browse_src_folder_btn.click(
             browse_source_folder,
             src_folder,
@@ -6559,6 +6846,7 @@ def build_ui():
                 dataset_align,
                 dataset_align_drop,
                 youtube_urls,
+                ready_auto_max,
             ],
             [train_manifest, val_manifest, dataset_log_box, dataset_status_box, prep_btn, stop_prep_btn, output_name, dataset_project_card, dataset_name_input],
         )
@@ -6808,6 +7096,9 @@ def build_ui():
                 v3_restore_best,
                 v3_max_batch_sec,
                 v3_best_only,
+                train_logging_epochs,
+                train_save_epochs,
+                train_eval_epochs,
             ],
             [logs_box, training_status_box, training_log_box, start_btn, stop_train_btn, refresh_training_btn, tb_btn],
         )
@@ -6840,6 +7131,7 @@ def build_ui():
         v3_precision.change(set_v3_runtime, [v3_precision, v3_attention_backend, v3_torch_compile], logs_box, queue=False)
         v3_attention_backend.change(set_v3_runtime, [v3_precision, v3_attention_backend, v3_torch_compile], logs_box, queue=False)
         v3_torch_compile.change(set_v3_runtime, [v3_precision, v3_attention_backend, v3_torch_compile], logs_box, queue=False)
+        v3_ref_max.change(set_ref_max, v3_ref_max, logs_box, queue=False)  # also when a GUI preset sets it
         lora_project.input(on_lora_project_change, [infer_model_select, lora_project], lora_adapter, queue=False, show_progress="hidden")
         infer_model_select.change(
             sync_lora_for_model,
@@ -6887,9 +7179,36 @@ def build_ui():
         gui_preset_load_btn.click(lambda name: load_gui_preset(preset_names, preset_list, name), gui_preset_select, preset_list,
                                   queue=False)
 
+        # ---------------- this tab's settings survive a reload (an app restart reloads the page)
+        _session_tab = gr.Textbox(visible=False)
+        tab_id_js = ("(() => { let id = sessionStorage.getItem('hv-tab'); const fresh = !id; "
+                     "if (!id) { id = crypto.randomUUID ? crypto.randomUUID() : ([1e7]+-1e3+-4e3+-8e3+-1e11).replace(/[018]/g, "
+                     "(c) => (c ^ Math.random() * 16 >> c / 4).toString(16)); sessionStorage.setItem('hv-tab', id); } "
+                     "return [id, fresh]; })()")
+        demo.load(lambda tab: session_restore(preset_names, preset_list, tab), _session_tab, preset_list,
+                  js=f"() => {{ const [id, fresh] = {tab_id_js}; return [fresh ? '' : id]; }}",
+                  queue=False, show_progress="hidden")
+        gr.on(
+            [c.change for c in preset_list],
+            lambda tab, *v: session_autosave(preset_names, tab, *v),
+            [_session_tab, *preset_list],
+            None,
+            js=f"(tab, ...v) => [{tab_id_js}[0], ...v]",
+            queue=False,
+            show_progress="hidden",
+            trigger_mode="always_last",
+        )
+
     return demo
 
 
 if __name__ == "__main__":
     _install_cmd_mirror()
-    build_ui().queue(default_concurrency_limit=1).launch(inbrowser=True, css=UI_CSS, js=APP_JS, theme=build_theme(), allowed_paths=[str(ROOT / "exp"), str(CACHE_DIR), str(OUTPUTS_DIR), str(ROOT / "projects"), str(TEMP_DIR)])
+    from gradio.utils import get_upload_folder
+
+    # Gradio's own file cache too: an audio a page got before the app was restarted (a library voice, a reference)
+    # is still served, instead of an empty player ("File not allowed" for files an earlier run handed out)
+    allowed = [ROOT / "exp", CACHE_DIR, OUTPUTS_DIR, ROOT / "projects", TEMP_DIR, SAMPLES_DIR, ROOT / "downloads",
+               Path(get_upload_folder())]
+    build_ui().queue(default_concurrency_limit=1).launch(inbrowser=True, css=UI_CSS, js=APP_JS, theme=build_theme(),
+                                                          allowed_paths=[str(p) for p in allowed])

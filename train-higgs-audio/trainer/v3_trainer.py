@@ -336,14 +336,18 @@ def _sample_duration(sample: dict) -> float:
 
 
 def _filter_by_duration(samples: list[dict], args: argparse.Namespace, label: str) -> list[dict]:
-    kept = [s for s in samples if args.min_audio_seconds <= _sample_duration(s) <= args.max_audio_seconds or _sample_duration(s) == 0.0]
+    """Clips shorter than --min_audio_seconds are skipped; --max_audio_seconds 0 (the default) keeps any length."""
+    top = float(args.max_audio_seconds or 0)
+
+    def keep(s: dict) -> bool:
+        d = _sample_duration(s)
+        return d == 0.0 or (d >= args.min_audio_seconds and (top <= 0 or d <= top))
+
+    kept = [s for s in samples if keep(s)]
     dropped = len(samples) - len(kept)
     if dropped:
-        print(
-            f"[v3-train] {label}: skipped {dropped} clip(s) outside {args.min_audio_seconds:g}-{args.max_audio_seconds:g}s "
-            "(long clips risk OOM and Higgs V3 reads ~25 s per pass at most)",
-            flush=True,
-        )
+        span = f"{args.min_audio_seconds:g}-{top:g}s" if top > 0 else f"under {args.min_audio_seconds:g}s"
+        print(f"[v3-train] {label}: skipped {dropped} clip(s) {'outside ' if top > 0 else ''}{span}", flush=True)
     return kept
 
 
@@ -550,6 +554,13 @@ def train(args: argparse.Namespace) -> None:
     batch_size = max(int(args.batch_size), 1)
     accum = max(int(args.gradient_accumulation_steps), 1)
     batches_per_epoch = len(_length_grouped_batches(train_samples, batch_size, args.max_batch_seconds))
+    # every-N-epochs settings win over their step twins (0 = use the steps)
+    for name in ("logging", "save", "eval"):
+        every = float(getattr(args, f"{name}_epochs", 0.0) or 0.0)
+        if every > 0:
+            steps = max(1, round(every * batches_per_epoch / max(args.gradient_accumulation_steps, 1)))
+            setattr(args, f"{name}_steps", steps)
+            print(f"[v3-train] {name} every {every:g} epochs = every {steps} steps", flush=True)
     total_updates = (
         args.max_steps
         if args.max_steps > 0
@@ -1232,6 +1243,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--logging_steps", type=int, default=1)
     parser.add_argument("--save_steps", type=int, default=100)
     parser.add_argument("--eval_steps", type=int, default=50)
+    parser.add_argument("--logging_epochs", type=float, default=0.0, help="log every N epochs (0 = use --logging_steps)")
+    parser.add_argument("--save_epochs", type=float, default=0.0, help="save every N epochs (0 = use --save_steps)")
+    parser.add_argument("--eval_epochs", type=float, default=0.0, help="eval every N epochs (0 = use --eval_steps)")
     parser.add_argument("--max_train_samples", type=int, default=-1)
     parser.add_argument("--max_eval_samples", type=int, default=24)
     parser.add_argument("--use_lora", action="store_true")
@@ -1249,7 +1263,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min_lr_ratio", type=float, default=0.1)
     parser.add_argument("--audio_lr_scale", type=float, default=0.1, help="LR multiplier for the tied audio embedding/head")
     parser.add_argument("--gradient_checkpointing", action="store_true")
-    parser.add_argument("--max_audio_seconds", type=float, default=30.0)
+    parser.add_argument("--max_audio_seconds", type=float, default=0.0, help="skip clips longer than this; 0 = no limit")
     parser.add_argument("--max_batch_seconds", type=float, default=40.0, help="Cap on padded audio seconds per micro-batch (0 = off)")
     parser.add_argument("--min_audio_seconds", type=float, default=0.5)
     parser.add_argument("--save_best", action="store_true")

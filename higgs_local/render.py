@@ -438,7 +438,8 @@ class Renderer:
             rep.features = f
             for flag in tc.sound_flags(f, want, text, tc.voice_norm(voice)):
                 {"defect": rep.issues, "note": rep.notes, "suspect": suspects}[tc.role(flag)].append(flag)
-        if (adv.asr_check or suspects) and self.asr is not None and not rep.issues:
+        # the take is only heard when "Check every new take by ear" is on: off, a suspect stays a note
+        if adv.asr_check and self.asr is not None and not rep.issues:
             self.events({"type": "phase", "phase": "Listening to the take"})
             heard, _status = self.asr.transcribe_whisper_direct(tmp_path, adv.asr_model, adv.language)
             rep.heard = heard

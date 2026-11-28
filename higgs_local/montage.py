@@ -951,10 +951,10 @@ async function openLine(o) {
       <label>Voice<select data-f="voice">${optHtml(voices, voice)}</select></label>
       <label>LoRA<select data-f="lora">${optHtml(loras, lora)}</select></label>
     </div>
-    <details class="tl-ref"${own ? ' open' : ''}><summary>🎙 Own reference audio (optional, wins over the library voice)</summary>
+    <details class="tl-ref"${own ? ' open' : ''}><summary>🎙 Own reference audio (optional, wins over the library voice · 5–30 s works best)</summary>
       <div class="tl-refbox" data-ref></div>
       <div class="tl-mrow"><label style="flex:3">Reference transcript<input type="text" data-f="ref_text" placeholder="What the reference says (empty: no transcript)"></label></div>
-      <div class="tl-mrow"><label style="flex:3">🎧 Separate the voice from music, noise or other voices<select data-f="sep">${optHtml(engines, 'voc_fv7+gabox_denoise')}</select></label>
+      <div class="tl-mrow"><label style="flex:3">🎧 Separate the voice from music, noise or other voices<select data-f="sep">${optHtml(engines, 'voc_fv7+gabox_denoise+becruily_karaoke')}</select></label>
         <button data-act="sep">🎧 Separate</button><button data-act="unsep">↩ Original</button></div>
       <div class="tl-sepnote" data-sepnote></div>
     </details>
